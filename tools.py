@@ -37,7 +37,9 @@ class Tee(io.TextIOBase):
 
     def isatty(self):
         # Preserve tty detection for progress bars etc.
-        return any(hasattr(stream, "isatty") and stream.isatty() for stream in self._streams)
+        return any(
+            hasattr(stream, "isatty") and stream.isatty()
+            for stream in self._streams)
 
     def fileno(self):
         # Some libraries, including Isaac Sim's faulthandler setup, require a
@@ -52,6 +54,7 @@ class Tee(io.TextIOBase):
 
 
 class ConsoleLogHandle:
+
     def __init__(self, stdout, stderr, stdout_tee, stderr_tee, file):
         self._stdout = stdout
         self._stderr = stderr
@@ -129,9 +132,17 @@ def weight_init_(m, fan_type="in"):
     in_num, out_num = nn_init._calculate_fan_in_and_fan_out(weight)
 
     with torch.no_grad():
-        fan = {"avg": (in_num + out_num) / 2, "in": in_num, "out": out_num}[fan_type]
+        fan = {
+            "avg": (in_num + out_num) / 2,
+            "in": in_num,
+            "out": out_num
+        }[fan_type]
         std = 1.1368 * np.sqrt(1 / fan)
-        nn.init.trunc_normal_(weight, mean=0.0, std=std, a=-2.0 * std, b=2.0 * std)
+        nn.init.trunc_normal_(weight,
+                              mean=0.0,
+                              std=std,
+                              a=-2.0 * std,
+                              b=2.0 * std)
         # set bias always 0
         bias = getattr(m, "bias", None)
         if bias is not None:
@@ -154,8 +165,14 @@ class MetricAccumulator:
         self._count = 0
 
     def add(self, metrics):
-        tensors = {k: v for k, v in metrics.items() if isinstance(v, torch.Tensor)}
-        self._latest = {k: v for k, v in metrics.items() if not isinstance(v, torch.Tensor)}
+        tensors = {
+            k: v
+            for k, v in metrics.items() if isinstance(v, torch.Tensor)
+        }
+        self._latest = {
+            k: v
+            for k, v in metrics.items() if not isinstance(v, torch.Tensor)
+        }
         keys = tuple(sorted(tensors))
         if keys != self._keys:
             # first call, or the metric set changed: start a fresh interval rather than
@@ -163,7 +180,8 @@ class MetricAccumulator:
             self._keys = keys
             self._sum = None
             self._count = 0
-        packed = torch.stack([tensors[k].detach().reshape(()).float() for k in keys])
+        packed = torch.stack(
+            [tensors[k].detach().reshape(()).float() for k in keys])
         self._sum = packed if self._sum is None else self._sum + packed
         self._count += 1
 
@@ -180,6 +198,7 @@ class MetricAccumulator:
 
 
 class CudaBenchmark:
+
     def __init__(self, comment):
         self._comment = comment
 
@@ -195,6 +214,7 @@ class CudaBenchmark:
 
 
 class Logger:
+
     def __init__(self, logdir, filename="metrics.jsonl"):
         self._logdir = logdir
         self._filename = filename
@@ -258,7 +278,12 @@ class Logger:
         self._last_step = step
         return steps / duration
 
-    def log_hydra_config(self, config, name="config", step=0, log_hparams=False, hparams_run_name="."):
+    def log_hydra_config(self,
+                         config,
+                         name="config",
+                         step=0,
+                         log_hparams=False,
+                         hparams_run_name="."):
         """
         Log a Hydra/OmegaConf config to TensorBoard:
           - as YAML text under "{name}/yaml"
@@ -275,7 +300,8 @@ class Logger:
         except ImportError:
             # Fallback to string representation
             yaml_str = str(config)
-        self._writer.add_text(f"{name}/yaml", f"```yaml\n{yaml_str}\n```", step)
+        self._writer.add_text(f"{name}/yaml", f"```yaml\n{yaml_str}\n```",
+                              step)
 
         # 2) Log flattened hparams to HParams plugin
         flat = {}
@@ -304,7 +330,8 @@ class Logger:
             # add_hparams requires a non-empty metrics dict
             with contextlib.suppress(TypeError):
                 # Avoid creating a timestamped subdirectory by specifying run_name (PyTorch >= 1.14)
-                self._writer.add_hparams(flat, {"_": 0}, run_name=hparams_run_name)
+                self._writer.add_hparams(flat, {"_": 0},
+                                         run_name=hparams_run_name)
 
 
 def convert(value, precision=32):
@@ -325,6 +352,7 @@ def convert(value, precision=32):
 
 
 class Every:
+
     def __init__(self, every):
         self._every = every
         self._last = None
@@ -341,6 +369,7 @@ class Every:
 
 
 class Once:
+
     def __init__(self):
         self._once = True
 
@@ -374,7 +403,10 @@ def enable_deterministic_run():
     torch.use_deterministic_algorithms(True)
 
 
-def recursively_collect_optim_state_dict(obj, path="", optimizers_state_dicts=None, visited=None):
+def recursively_collect_optim_state_dict(obj,
+                                         path="",
+                                         optimizers_state_dicts=None,
+                                         visited=None):
     if optimizers_state_dicts is None:
         optimizers_state_dicts = {}
     if visited is None:
@@ -385,15 +417,19 @@ def recursively_collect_optim_state_dict(obj, path="", optimizers_state_dicts=No
     visited.add(id(obj))
     attrs = obj.__dict__
     if isinstance(obj, torch.nn.Module):
-        attrs.update({k: attr for k, attr in obj.named_modules() if "." not in k and obj != attr})
+        attrs.update({
+            k: attr
+            for k, attr in obj.named_modules() if "." not in k and obj != attr
+        })
     for name, attr in attrs.items():
         new_path = path + "." + name if path else name
         if isinstance(attr, torch.optim.Optimizer):
             optimizers_state_dicts[new_path] = attr.state_dict()
         elif hasattr(attr, "__dict__"):
             optimizers_state_dicts.update(
-                recursively_collect_optim_state_dict(attr, new_path, optimizers_state_dicts, visited)
-            )
+                recursively_collect_optim_state_dict(attr, new_path,
+                                                     optimizers_state_dicts,
+                                                     visited))
     return optimizers_state_dicts
 
 
@@ -422,7 +458,8 @@ def build_module_tree(module: nn.Module, module_name: str = "") -> dict:
         children_info[cname] = build_module_tree(child, cname)
 
     # 3) Calculate total parameter count for this module (including all children)
-    total = direct_param_count + sum(child["total"] for child in children_info.values())
+    total = direct_param_count + sum(child["total"]
+                                     for child in children_info.values())
 
     return {
         "name": module_name,
@@ -478,7 +515,7 @@ def compute_rms(tensors):
     flattened = torch.cat([t.view(-1) for t in tensors if t is not None])
     if len(flattened) == 0:
         return torch.tensor(0.0)
-    return torch.linalg.norm(flattened, ord=2) / (flattened.numel() ** 0.5)
+    return torch.linalg.norm(flattened, ord=2) / (flattened.numel()**0.5)
 
 
 def compute_global_norm(tensors):
@@ -520,7 +557,8 @@ def print_param_stats(model):
             rms_val = data.pow(2).mean().sqrt().item()
 
             hierarchical_name = name.replace(".", "/")
-            stats.append((hierarchical_name, mean_val, std_val, l2_val, rms_val))
+            stats.append(
+                (hierarchical_name, mean_val, std_val, l2_val, rms_val))
 
     # Format function to display numbers in scientific notation with 3 significant digits
     def fmt(v):
@@ -546,5 +584,4 @@ def print_param_stats(model):
                 fmt(std_val),
                 fmt(l2_val),
                 fmt(rms_val),
-            )
-        )
+            ))

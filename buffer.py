@@ -28,7 +28,8 @@ class OnlineQueue:
             pending.append((data[env].clone(), where[env]))
             if len(pending) == self.window:
                 steps, rows = zip(*pending)
-                self.queue.append((torch.stack(steps), env, torch.tensor(rows)))
+                self.queue.append(
+                    (torch.stack(steps), env, torch.tensor(rows)))
                 pending.clear()
 
     def take(self, count):
@@ -41,6 +42,7 @@ class OnlineQueue:
 
 
 class Buffer:
+
     def __init__(self, config):
         self.device = torch.device(config.device)
         self.storage_device = torch.device(config.storage_device)
@@ -48,14 +50,20 @@ class Buffer:
         self.batch_length = int(config.batch_length)
         self.num_eps = 0
         self._buffer = ReplayBuffer(
-            storage=LazyTensorStorage(max_size=config.max_size, device=self.storage_device, ndim=2),
-            sampler=SliceSampler(
-                num_slices=self.batch_size, end_key=None, traj_key="episode", truncated_key=None, strict_length=True
-            ),
+            storage=LazyTensorStorage(max_size=config.max_size,
+                                      device=self.storage_device,
+                                      ndim=2),
+            sampler=SliceSampler(num_slices=self.batch_size,
+                                 end_key=None,
+                                 traj_key="episode",
+                                 truncated_key=None,
+                                 strict_length=True),
             prefetch=0,
-            batch_size=self.batch_size * (self.batch_length + 1),  # +1 for context
+            batch_size=self.batch_size *
+            (self.batch_length + 1),  # +1 for context
         )
-        self._online = OnlineQueue(self.batch_length + 1, 2 * self.batch_size) if config.online else None
+        self._online = OnlineQueue(self.batch_length + 1, 2 *
+                                   self.batch_size) if config.online else None
         self._update_latents = bool(config.update_latents)
 
     def add_transition(self, data):
@@ -68,7 +76,9 @@ class Buffer:
     def sample(self, prefer_online=True):
         # Freshly collected windows take precedence for training. Logging can sample
         # regular replay without consuming a window reserved for learning.
-        ready = self._online.take(self.batch_size) if prefer_online and self._online is not None else None
+        ready = self._online.take(
+            self.batch_size
+        ) if prefer_online and self._online is not None else None
         if ready is not None:
             return self._online_batch(ready)
         sample_td, info = self._buffer.sample(return_info=True)
@@ -79,8 +89,11 @@ class Buffer:
         # The initial ones are used only to extract the latent vector
         initial = (sample_td["stoch"][:, 0], sample_td["deter"][:, 0])
         data = sample_td[:, 1:]
-        data.set_("action", sample_td["action"][:, :-1].clone())  # action is 1 step back
-        index = [ind.view(-1, self.batch_length + 1)[:, 1:] for ind in info["index"]]
+        data.set_("action",
+                  sample_td["action"][:, :-1].clone())  # action is 1 step back
+        index = [
+            ind.view(-1, self.batch_length + 1)[:, 1:] for ind in info["index"]
+        ]
         return data, index, initial
 
     def _to_device(self, sample_td):
@@ -114,7 +127,12 @@ class Buffer:
         deter = deter.reshape(-1, *deter.shape[2:])
         # In storage, the length is the first dimension, and the batch (number of environments) is the second dimension.
         n = index[0].shape[0]
-        self._buffer[index[1], index[0]] = TensorDict({"stoch": stoch, "deter": deter}, batch_size=(n,))
+        self._buffer[index[1],
+                     index[0]] = TensorDict({
+                         "stoch": stoch,
+                         "deter": deter
+                     },
+                                            batch_size=(n, ))
 
     def count(self):
         if self._buffer.storage.shape is None:
