@@ -1,104 +1,81 @@
-## R2-Dreamer: Redundancy-Reduced World Models without Decoders or Augmentation
+# Atari quick start
 
-This repository provides the official implementation of [R2-Dreamer][r2dreamer] (ICLR 2026), a decoder-free, augmentation-free world model with redundancy-reducing regularization on latent representations. It also includes an efficient PyTorch DreamerV3 reproduction that trains **~5x faster** than a widely used [codebase][dreamerv3-torch], along with other baselines. Selecting R2-Dreamer via the config provides an additional **~1.6x speedup** over this baseline.
+Run the commands below from the repository root. Training defaults to an NVIDIA GPU; install a driver compatible with your chosen PyTorch CUDA build.
 
-## Instructions
-
-Install dependencies. This repository is tested with Ubuntu 24.04 and Python 3.11.
-
-Installing via a virtual env like [uv](https://docs.astral.sh/uv/) is recommended. If you prefer Docker, follow [`docs/docker.md`](docs/docker.md).
+## Installation (Conda, Python 3.12)
 
 ```bash
-# Select the environments you need, or use "all" to install everything.
-# Available extras: dmc, atari, crafter, metaworld, memorymaze, isaaclab, all
-pip install -e ".[dmc,metaworld]"
+conda create -n r2dreamer python=3.12 pip -y
+conda activate r2dreamer
+python -m pip install --upgrade pip setuptools wheel
 ```
 
-Run training on default settings:
+Use the [official PyTorch installation selector](https://pytorch.org/get-started/locally/) to select **Stable**, your OS, **Pip**, **Python**, and a CUDA build supported by your GPU and driver. Run its installation command inside this Conda environment. Only `torch` is needed here; `torchvision` and `torchaudio` are not used.
+
+Then install the remaining requirements:
 
 ```bash
-python3 train.py logdir=./logdir/test
+python -m pip install -r requirements.txt
+python -m pip check
 ```
 
-Monitoring results:
-```bash
-tensorboard --logdir ./logdir
-```
+PyTorch, Gymnasium, and ALE are unpinned. In a fresh environment, pip selects compatible current stable releases; the command above preserves an already installed compatible CUDA build of PyTorch. TorchRL and TensorDict are included for replay storage and tensor batches. Other dependencies cover configuration, multiprocessing, image preprocessing, and plain-text metric logging.
 
-Switching algorithms:
+Current [ALE installations include the Atari ROMs](https://ale.farama.org/main/getting-started/).
 
-```bash
-# Choose an algorithm via model.rep_loss:
-# r2dreamer|dreamer|infonce|dreamerpro
-python3 train.py model.rep_loss=r2dreamer
-```
-
-For easier code reading, inline tensor shape annotations are provided. See [`docs/tensor_shapes.md`](docs/tensor_shapes.md).
-
-
-## Available Benchmarks
-At the moment, the following benchmarks are available in this repository.
-
-| Environment        | Observation | Action | Budget | Description |
-|-------------------|---|---|---|-----------------------|
-| [Meta-World](https://github.com/Farama-Foundation/Metaworld) | Image | Continuous | 1M | Robotic manipulation with complex contact interactions.|
-| [DMC Proprio](https://github.com/deepmind/dm_control) | State | Continuous | 500K | DeepMind Control Suite with low-dimensional inputs. |
-| [DMC Vision](https://github.com/deepmind/dm_control) | Image | Continuous |1M| DeepMind Control Suite with high-dimensional images inputs. |
-| [DMC Subtle](envs/dmc_subtle.py) | Image | Continuous |1M| DeepMind Control Suite with tiny task-relevant objects. |
-| [Atari 100k](https://github.com/Farama-Foundation/Arcade-Learning-Environment) | Image | Discrete |400K| 26 Atari games. |
-| [Crafter](https://github.com/danijar/crafter) | Image | Discrete |1M| Survival environment to evaluates diverse agent abilities.|
-| [Memory Maze](https://github.com/jurgisp/memory-maze) | Image |Discrete |100M| 3D mazes to evaluate RL agents' long-term memory.|
-| [IsaacLab](https://github.com/isaac-sim/IsaacLab) | State / Image | Continuous | 0.5M–1M | GPU-parallelized robotic simulation. |
-
-Use Hydra to select a benchmark and a specific task using `env` and `env.task`, respectively.
+Check CUDA and the Atari environment:
 
 ```bash
-python3 train.py ... env=dmc_vision env.task=dmc_walker_walk
+python - <<'PYTHON'
+import torch
+from envs.atari import Atari
+
+print("PyTorch:", torch.__version__, "CUDA:", torch.version.cuda)
+assert torch.cuda.is_available(), "Check your NVIDIA driver and PyTorch CUDA build"
+print("GPU:", torch.cuda.get_device_name(0))
+env = Atari("pong", sticky=False)
+obs = env.reset(seed=0)
+print("Atari image:", obs["image"].shape)
+env.close()
+PYTHON
 ```
 
-## Headless rendering
+## Run training
 
-If you run MuJoCo-based environments (DMC / MetaWorld) on headless machines, you may need to set `MUJOCO_GL` for offscreen rendering. **Using EGL is recommended** as it accelerates rendering, leading to faster simulation throughput.
+The existing [run.sh](run.sh) trains the 100M model on Atari Pong:
 
 ```bash
-# For example, when using EGL (GPU)
-export MUJOCO_GL=egl
-# (optional) Choose which GPU EGL uses
-export MUJOCO_EGL_DEVICE_ID=0
+bash run.sh
 ```
 
-More details: [Working with MuJoCo-based environments](https://docs.pytorch.org/rl/stable/reference/generated/knowledge_base/MUJOCO_INSTALLATION.html)
-
-## Code formatting
-
-If you want automatic formatting/basic checks before commits, you can enable `pre-commit`:
+Its command is:
 
 ```bash
-pip install pre-commit
-# This sets up a pre-commit hook so that checks are run every time you commit
-pre-commit install
-# Manual pre-commit run on all files
-pre-commit run --all-files
+python3 train.py model=size100M env=atari100k env.task=atari_pong
 ```
 
-## Troubleshooting
+To select a GPU:
 
-If you encounter installation or runtime issues, please refer to our [Troubleshooting Guide](docs/troubleshooting.md).
-
-## Citation
-
-If you find this code useful, please consider citing:
-
-```bibtex
-@inproceedings{
-morihira2026rdreamer,
-title={R2-Dreamer: Redundancy-Reduced World Models without Decoders or Augmentation},
-author={Naoki Morihira and Amal Nahar and Kartik Bharadwaj and Yasuhiro Kato and Akinobu Hayashi and Tatsuya Harada},
-booktitle={The Fourteenth International Conference on Learning Representations},
-year={2026},
-url={https://openreview.net/forum?id=Je2QqXrcQq}
-}
+```bash
+CUDA_VISIBLE_DEVICES=0 bash run.sh
 ```
 
-[r2dreamer]: https://openreview.net/forum?id=Je2QqXrcQq&referrer=%5BAuthor%20Console%5D(%2Fgroup%3Fid%3DICLR.cc%2F2026%2FConference%2FAuthors%23your-submissions)
-[dreamerv3-torch]: https://github.com/NM512/dreamerv3-torch
+To change the game or seed, invoke the training entry point directly:
+
+```bash
+python train.py model=size100M env=atari100k env.task=atari_alien seed=0
+```
+
+Training writes `console.log`, scalar metrics in `metrics.jsonl`, the resolved `config.yaml`, and the final `latest.pt` checkpoint under `logdir/` by default. To follow a run's metrics:
+
+```bash
+tail -f logdir/<date>/<time>/metrics.jsonl
+```
+
+## Trajectory consistency check
+
+```bash
+python test-consistency.py
+```
+
+This replays the bundled `atari_MontezumaRevenge.pkl` dataset through `envs/atari.py` and checks cumulative rewards.

@@ -34,7 +34,7 @@ def main(config):
 
     logger = tools.Logger(logdir)
     # save config
-    logger.log_hydra_config(config)
+    logger.save_config(config)
 
     replay_buffer = Buffer(config.buffer)
 
@@ -49,7 +49,7 @@ def main(config):
     ).to(config.device)
 
     policy_trainer = OnlineTrainer(config.trainer, replay_buffer, logger,
-                                   logdir, train_envs, eval_envs)
+                                   train_envs, eval_envs)
     policy_trainer.begin(agent)
 
     items_to_save = {

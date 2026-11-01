@@ -300,41 +300,6 @@ class Dreamer(nn.Module):
             },
             batch_size=(B, ))
 
-    @torch.no_grad()
-    def video_pred(self, data, initial):
-        torch.compiler.cudagraph_mark_step_begin()
-        p_data = self.preprocess(data)
-        return self._video_pred(p_data, initial)
-
-    def _video_pred(self, data, initial):
-        """Video prediction utility."""
-        if self.rep_loss != "dreamer":
-            raise NotImplementedError(
-                "video_pred requires decoder and is only supported when rep_loss == 'dreamer'."
-            )
-
-        B = min(data["action"].shape[0], 6)
-        # (B, T, E)
-        embed = self.encoder(data)
-
-        post_stoch, post_deter, _ = self.rssm.observe(
-            embed[:B, :5],
-            data["action"][:B, :5],
-            tuple(val[:B] for val in initial),
-            data["is_first"][:B, :5],
-        )
-        recon = self.decoder(post_stoch, post_deter)["image"].mode()[:B]
-        init_stoch, init_deter = post_stoch[:, -1], post_deter[:, -1]
-        prior_stoch, prior_deter = self.rssm.imagine_with_action(
-            init_stoch,
-            init_deter,
-            data["action"][:B, 5:],
-        )
-        openl = self.decoder(prior_stoch, prior_deter)["image"].mode()
-        model = torch.cat([recon[:, :5], openl], 1)
-        truth = data["image"][:B]
-        error = (model - truth + 1.0) / 2.0
-        return torch.cat([truth, model, error], 2)
 
     def update(self, replay_buffer):
         """Sample a batch from replay and perform one optimization step."""

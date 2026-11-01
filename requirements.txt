@@ -1,0 +1,13 @@
+# Install a CUDA-enabled PyTorch build for your GPU (see README-x.md).
+# Unpinned packages resolve to the latest compatible stable releases.
+torch
+torchrl
+tensordict
+gymnasium
+ale-py
+numpy
+hydra-core
+omegaconf
+cloudpickle
+Pillow
+opencv-python

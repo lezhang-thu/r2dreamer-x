@@ -229,19 +229,6 @@ class RSSM(nn.Module):
         stoch = self.get_dist(logit).rsample()
         return stoch, logit
 
-    def imagine_with_action(self, stoch, deter, actions):
-        """Roll out prior dynamics given a sequence of actions."""
-        # (B, S, K), (B, D), (B, T, A)
-        L = actions.shape[1]
-        stochs, deters = [], []
-        for i in range(L):
-            stoch, deter = self.img_step(stoch, deter, actions[:, i])
-            stochs.append(stoch)
-            deters.append(deter)
-        # (B, T, S, K), (B, T, D)
-        stochs = torch.stack(stochs, dim=1)
-        deters = torch.stack(deters, dim=1)
-        return stochs, deters
 
     def get_feat(self, stoch, deter):
         """Flatten stoch and concatenate with deter."""

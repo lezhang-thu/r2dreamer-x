@@ -73,12 +73,11 @@ class Buffer:
         if self._online is not None:
             self._online.push(data, coords)
 
-    def sample(self, prefer_online=True):
-        # Freshly collected windows take precedence for training. Logging can sample
-        # regular replay without consuming a window reserved for learning.
+    def sample(self):
+        # Freshly collected windows take precedence for training.
         ready = self._online.take(
             self.batch_size
-        ) if prefer_online and self._online is not None else None
+        ) if self._online is not None else None
         if ready is not None:
             return self._online_batch(ready)
         sample_td, info = self._buffer.sample(return_info=True)
