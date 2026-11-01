@@ -49,8 +49,8 @@ do
             logdir=logdir/${DATE}_${METHOD}_${task#atari_}_$seed \
             model.compile=True \
             device=cuda:0 \
-            buffer.storage_device=cuda:0 \
-            model=size200M \
+            buffer.storage_device=cpu \
+            model=size100M \
             model.rep_loss=${METHOD} \
             seed=$seed
     done

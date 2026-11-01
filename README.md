@@ -42,23 +42,15 @@ PYTHON
 
 ## Run training
 
-The existing [run.sh](run.sh) trains the 100M model on Atari Pong:
+Run the Atari experiment launcher from the repository root with the Conda environment active:
 
 ```bash
-bash run.sh
+bash runs/atari.sh
 ```
 
-Its command is:
+[runs/atari.sh](runs/atari.sh) runs the 100M R2-Dreamer model sequentially across 26 Atari games and seeds `0, 100, 200, 300, 400`. It enables model compilation and stores replay data on CPU.
 
-```bash
-python3 train.py model=size100M env=atari100k env.task=atari_pong
-```
-
-To select a GPU:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 bash run.sh
-```
+Edit `GPU_ID`, `SEED_START`, `SEED_END`, `SEED_STEP`, `METHOD`, and the `tasks` array in the script to configure the sweep. `GPU_ID` selects the physical GPU; the training process uses it as `cuda:0`. Each run writes to `logdir/<date>_<method>_<game>_<seed>/`.
 
 To change the game or seed, invoke the training entry point directly:
 
