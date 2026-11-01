@@ -1,15 +1,18 @@
 import collections
-import os
+import threading
 
 import ale_py
-import ale_py.roms as roms
 import gymnasium as gym
 import numpy as np
 from PIL import Image
 
 
+gym.register_envs(ale_py)
+
+
 class Atari(gym.Env):
-    LOCK = None
+    # DreamerV3 ALE behavior adapted to this project's Gym-style interface.
+    LOCK = threading.Lock()
     metadata = {}
     ACTION_MEANING = (
         "NOOP",
@@ -59,12 +62,6 @@ class Atari(gym.Env):
         assert pooling >= 1, pooling
         assert action_repeat >= 1, action_repeat
 
-        if self.LOCK is None:
-            import multiprocessing as mp
-
-            mp = mp.get_context("spawn")
-            self.LOCK = mp.Lock()
-
         self._resize_fn = resize
         if self._resize_fn == "opencv":
             import cv2
@@ -86,17 +83,30 @@ class Atari(gym.Env):
         self._clip_reward = clip_reward
         self._rng = np.random.default_rng(seed)
 
+        self._seed = seed
+        # Resolve snake_case config names and canonical Gym names alike.
+        games = {
+            spec.kwargs["game"].replace("_", "").lower(): env_id
+            for env_id, spec in gym.registry.items()
+            if env_id.startswith("ALE/") and env_id.endswith("-v5") and "game" in spec.kwargs
+        }
+        env_id = games[name.replace("_", "").lower()]
         with self.LOCK:
-            self.ale = ale_py.ALEInterface()
-            self.ale.setLoggerMode(ale_py.LoggerMode.Error)
-            self.ale.setInt(b"random_seed", self._rng.integers(0, 2**31))
-            path = os.environ.get("ALE_ROM_PATH")
-            if path:
-                self.ale.loadROM(os.path.join(path, f"{name}.bin"))
-            else:
-                self.ale.loadROM(roms.get_rom_path(name))
-
-        self.ale.setFloat("repeat_action_probability", 0.25 if sticky else 0.0)
+            self._env = gym.make(
+                env_id,
+                obs_type="rgb",
+                frameskip=1,
+                mode=None,
+                difficulty=None,
+                repeat_action_probability=0.25 if sticky else 0.0,
+                full_action_space=actions == "all",
+                # This wrapper counts episode frames, excluding reset no-ops.
+                max_num_frames_per_episode=0,
+                render_mode=None,
+            )
+        self.ale = self._env.unwrapped.ale
+        self._action_meanings = self._env.unwrapped.get_action_meanings()
+        assert self._action_meanings[0] == "NOOP"
         self.actionset = {
             "all": self.ale.getLegalActionSet,
             "needed": self.ale.getMinimalActionSet,
@@ -124,60 +134,79 @@ class Atari(gym.Env):
 
     @property
     def action_space(self):
-        return gym.spaces.Discrete(len(self.actionset))
+        return self._env.action_space
 
     def step(self, action):
         total_reward = 0.0
-        dead = False
+        is_terminal = False
+        is_last = False
+        assert 0 <= action < len(self.actionset), action
 
         for repeat in range(self._repeat):
-            reward = self.ale.act(self.actionset[action])
+            _, reward, terminated, truncated, _ = self._env.step(action)
             self._step += 1
             total_reward += reward
 
             if repeat >= self._repeat - self._pooling:
                 self._render()
 
-            if self.ale.game_over():
-                dead = True
-                break
+            if terminated:
+                is_terminal = True
+            if terminated or truncated:
+                is_last = True
+            if self._length and self._step >= self._length:
+                is_last = True
 
             current_lives = self.ale.lives()
-            if self._lives != "unused" and current_lives < self._last_lives:
-                dead = True
-                break
+            if 0 < current_lives < self._last_lives:
+                if self._lives == "discount":
+                    is_terminal = True
+                elif self._lives == "reset":
+                    is_terminal = True
+                    is_last = True
             self._last_lives = current_lives
+            if is_terminal or is_last:
+                break
 
-        self._done = self.ale.game_over() or (self._length and self._step >= self._length)
+        self._done = is_last
 
         return self._obs(
             total_reward,
-            is_last=self._done or (dead and self._lives == "reset"),
-            is_terminal=dead or self.ale.game_over(),
+            is_last=is_last,
+            is_terminal=is_terminal,
         )
 
-    def reset(self):
+    def reset(self, seed=None):
+        # Apply the constructor seed on the first reset only. An explicit seed
+        # restarts both emulator randomness and random reset no-ops.
+        seed = self._seed if seed is None else seed
+        if seed is not None:
+            self._rng = np.random.default_rng(seed)
         with self.LOCK:
-            self.ale.reset_game()
+            self._env.reset(seed=seed)
+        self._seed = None
 
-        if self._noops:
-            for _ in range(self._rng.integers(self._noops + 1)):
-                self.ale.act(self.ACTION_MEANING.index("NOOP"))
-                if self.ale.game_over():
-                    with self.LOCK:
-                        self.ale.reset_game()
-
-        if self._autostart and self.ACTION_MEANING.index("FIRE") in self.actionset:
-            self.ale.act(self.ACTION_MEANING.index("FIRE"))
-            if self.ale.game_over():
+        for _ in range(self._rng.integers(self._noops + 1)):
+            _, _, terminated, truncated, _ = self._env.step(0)
+            if terminated or truncated:
                 with self.LOCK:
-                    self.ale.reset_game()
+                    self._env.reset()
+
+        if self._autostart and "FIRE" in self._action_meanings:
+            for action in ("FIRE", "UP"):
+                if action not in self._action_meanings:
+                    continue
+                _, _, terminated, truncated, _ = self._env.step(self._action_meanings.index(action))
+                if terminated or truncated:
+                    with self.LOCK:
+                        self._env.reset()
 
         self._last_lives = self.ale.lives()
         self._render()
         # Fill the buffer with the first frame
-        for _ in range(self._pooling - 1):
-            self._buffers.appendleft(self._buffers[0].copy())
+        for i, buffer in enumerate(self._buffers):
+            if i > 0:
+                np.copyto(buffer, self._buffers[0])
 
         self._done = False
         self._step = 0
@@ -208,6 +237,7 @@ class Atari(gym.Env):
             "image": image,
             "is_first": is_first,
             "is_last": is_last,
+            # Keep time-limit truncation distinct from terminal transitions.
             "is_terminal": is_terminal,
         }
         return obs, reward, is_last, {}
@@ -218,4 +248,4 @@ class Atari(gym.Env):
         self.ale.getScreenRGB(self._buffers[0])
 
     def close(self):
-        pass
+        return self._env.close()
