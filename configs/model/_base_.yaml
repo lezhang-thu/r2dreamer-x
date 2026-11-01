@@ -67,18 +67,6 @@ rssm:
   device: ${device}
 
 encoder:
-  mlp_keys: ${env.encoder.mlp_keys}
-  cnn_keys: ${env.encoder.cnn_keys}
-  mlp:
-    shape: null
-    layers: 3
-    units: ${model.units}
-    act: ${model.act}
-    norm: ${model.norm}
-    device: ${device}
-    outscale: null
-    symlog_inputs: True
-    name: 'mlp_encoder'
   cnn:
     act: ${model.act}
     norm: ${model.norm}
@@ -88,24 +76,8 @@ encoder:
     mults: [2, 3, 4, 4]
 
 decoder:
-  mlp_keys: ${env.decoder.mlp_keys}
-  cnn_keys: ${env.decoder.cnn_keys}
-  mlp_dist:
-    name: 'symlog_mse'
   cnn_dist:
     name: 'mse'
-  mlp:
-    shape: null
-    layers: 3
-    units: ${model.units}
-    act: ${model.act}
-    norm: ${model.norm}
-    dist:
-      name: 'identity'
-    device: ${device}
-    outscale: 1.0
-    symlog_inputs: False
-    name: 'mlp_decoder'
   cnn:
     depth: ${model.depth}
     units: ${model.units}
@@ -128,7 +100,6 @@ reward:
     bin_num: 255
   outscale: 0.0
   device: ${device}
-  symlog_inputs: False
   name: 'reward'
 
 cont:
@@ -141,7 +112,6 @@ cont:
     name: 'binary'
   outscale: 1.0
   device: ${device}
-  symlog_inputs: False
   name: 'cont'
 
 actor:
@@ -152,18 +122,9 @@ actor:
   norm: ${model.norm}
   device: ${device}
   dist:
-    cont:
-      name: 'bounded_normal'
-      min_std: 0.1
-      max_std: 1.0
-    disc:
-      name: 'onehot'
-      unimix_ratio: 0.01
-    multi_disc:
-      name: 'multi_onehot'
-      unimix_ratio: 0.01
+    name: 'onehot'
+    unimix_ratio: 0.01
   outscale: 0.01
-  symlog_inputs: False
   name: 'actor'
 
 critic:
@@ -177,5 +138,4 @@ critic:
     name: 'symexp_twohot'
     bin_num: 255
   outscale: 0.0
-  symlog_inputs: False
   name: 'value'

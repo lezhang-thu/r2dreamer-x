@@ -1,6 +1,5 @@
 import gymnasium as gym
 import numpy as np
-import torch
 
 import tools
 
@@ -27,22 +26,6 @@ class TimeLimit(gym.Wrapper):
     def reset(self):
         self._step = 0
         return self.env.reset()
-
-
-class NormalizeActions(gym.Wrapper):
-    def __init__(self, env):
-        super().__init__(env)
-        self._mask = np.logical_and(np.isfinite(env.action_space.low), np.isfinite(env.action_space.high))
-        self._low = np.where(self._mask, env.action_space.low, -1)
-        self._high = np.where(self._mask, env.action_space.high, 1)
-        low = np.where(self._mask, -np.ones_like(self._low), self._low)
-        high = np.where(self._mask, np.ones_like(self._low), self._high)
-        self.action_space = gym.spaces.Box(low, high, dtype=np.float32)
-
-    def step(self, action):
-        original = (action + 1) / 2 * (self._high - self._low) + self._low
-        original = np.where(self._mask, original, action)
-        return self.env.step(original)
 
 
 class OneHotAction(gym.Wrapper):
@@ -72,51 +55,6 @@ class OneHotAction(gym.Wrapper):
         reference = np.zeros(actions, dtype=np.float32)
         reference[index] = 1.0
         return reference
-
-
-class MultiOneHotAction(gym.Wrapper):
-    def __init__(self, env, device):
-        assert isinstance(env.action_space, gym.spaces.MultiDiscrete)
-        super().__init__(env)
-        self.index_low = torch.tensor(self.action_space.low, device=device)
-        space = gym.spaces.Box(low=0, high=1, shape=self.env.action_space.nvec, dtype=np.float32)
-        space.multi_discrete = True
-        self.action_space = space
-
-    def step(self, action1, action2, done):
-        action1 = self.convert(action1)
-        action2 = self.convert(action2)
-        return self.env.step(action1, action2, done)
-
-    def convert(self, action):
-        now = 0
-        indexes = []
-        for dim in self.action_space.shape:
-            index = torch.argmax(action[:, now : now + dim], dim=-1, keepdim=True)
-            indexes.append(index)
-            now += dim
-        return torch.cat(indexes, dim=-1) + self.index_low
-
-
-class RewardObs(gym.Wrapper):
-    def __init__(self, env):
-        super().__init__(env)
-        spaces = self.env.observation_space.spaces
-        if "obs_reward" not in spaces:
-            spaces["obs_reward"] = gym.spaces.Box(-np.inf, np.inf, shape=(1,), dtype=np.float32)
-        self.observation_space = gym.spaces.Dict(spaces)
-
-    def step(self, action):
-        obs, reward, done, info = self.env.step(action)
-        if "obs_reward" not in obs:
-            obs["obs_reward"] = np.array([reward], dtype=np.float32)
-        return obs, reward, done, info
-
-    def reset(self):
-        obs = self.env.reset()
-        if "obs_reward" not in obs:
-            obs["obs_reward"] = np.array([0.0], dtype=np.float32)
-        return obs
 
 
 class Dtype(gym.Wrapper):

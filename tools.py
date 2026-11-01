@@ -42,8 +42,7 @@ class Tee(io.TextIOBase):
             for stream in self._streams)
 
     def fileno(self):
-        # Some libraries, including Isaac Sim's faulthandler setup, require a
-        # real file descriptor from sys.stdout/sys.stderr.
+        # Preserve access to the underlying stdout/stderr file descriptor.
         for stream in self._streams:
             if hasattr(stream, "fileno"):
                 try:

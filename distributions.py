@@ -5,10 +5,6 @@ from torch.nn import functional as F
 from tools import to_f32, to_i32
 
 
-def symlog(x):
-    return torch.sign(x) * torch.log1p(torch.abs(x))
-
-
 def symexp(x):
     return torch.sign(x) * torch.expm1(torch.abs(x))
 
@@ -48,39 +44,6 @@ class OneHotDist(torchd.one_hot_categorical.OneHotCategorical):
 
     def sample(self, **kwargs):
         raise NotImplementedError
-
-
-class MultiOneHotDist:
-
-    def __init__(self, logits, shape, unimix_ratio=0.0):
-        self.shape = shape
-        splits = torch.split(logits, shape, dim=-1)
-        self.onehots = [
-            OneHotDist(s, unimix_ratio=unimix_ratio) for s in splits
-        ]
-
-    @property
-    def mode(self):
-        _modes = [dist.mode for dist in self.onehots]
-        return torch.cat(_modes, dim=-1)
-
-    def rsample(self, sample_shape=()):
-        _rsamples = [dist.rsample() for dist in self.onehots]
-        return torch.cat(_rsamples, dim=-1)
-
-    def sample(self, **kwargs):
-        raise NotImplementedError
-
-    def log_prob(self, value):
-        splits = torch.split(value, self.shape, dim=-1)
-        _log_probs = [
-            dist.log_prob(s) for dist, s in zip(self.onehots, splits)
-        ]
-        return sum(_log_probs)
-
-    def entropy(self):
-        _entropies = [dist.entropy() for dist in self.onehots]
-        return sum(_entropies)
 
 
 class TwoHot:
@@ -173,86 +136,8 @@ class MSEDist:
         return -loss  # (...)
 
 
-class SymlogDist:
-
-    def __init__(self, mode, dist="mse", agg="sum", tol=1e-8):
-        # (..., D)
-        self._mode = to_f32(mode)
-        self._dist = dist
-        self._agg = agg
-        self._tol = tol
-
-    def mode(self):
-        return symexp(self._mode)
-
-    def mean(self):
-        return symexp(self._mode)
-
-    def log_prob(self, value):
-        # (..., D)
-        assert self._mode.shape == value.shape
-        assert self._mode.dtype == value.dtype
-        if self._dist == "mse":
-            distance = (self._mode - symlog(value))**2.0
-            distance = torch.where(distance < self._tol, 0, distance)
-        elif self._dist == "abs":
-            distance = torch.abs(self._mode - symlog(value))
-            distance = torch.where(distance < self._tol, 0, distance)
-        else:
-            raise NotImplementedError(self._dist)
-        if self._agg == "mean":
-            loss = distance.mean(list(range(len(distance.shape)))[2:])
-        elif self._agg == "sum":
-            loss = distance.sum(list(range(len(distance.shape)))[2:])
-        else:
-            raise NotImplementedError(self._agg)
-        return -loss  # (...)
-
-
-class Bound:
-
-    def __init__(self, dist):
-        super().__init__()
-        self._dist = dist
-
-    def __getattr__(self, name):
-        return getattr(self._dist, name)
-
-    def entropy(self):
-        return self._dist.entropy()
-
-    @property
-    def mode(self):
-        out = self._dist.mean
-        return out / torch.clip(torch.abs(out), min=1.0).detach()
-
-    def sample(self, sample_shape=()):
-        out = self._dist.rsample(sample_shape)
-        return out / torch.clip(torch.abs(out), min=1.0).detach()
-
-    def log_prob(self, x):
-        return self._dist.log_prob(x)
-
-
-def bounded_normal(x, min_std, max_std, **kwargs):
-    mean, std = torch.chunk(x, 2, dim=-1)
-    std = (max_std - min_std) * torch.sigmoid(std + 2.0) + min_std
-    # NOTE: Bound can be added
-    dist = torchd.normal.Normal(torch.tanh(to_f32(mean)), to_f32(std))
-    return torchd.independent.Independent(dist, 1)
-
-
-def normal_std_fixed(mean, std, **kwargs):
-    dist = torchd.normal.Normal(to_f32(mean), to_f32(std))
-    return Bound(torchd.independent.Independent(dist, 1))
-
-
 def onehot(mean, unimix_ratio, **kwargs):
     return OneHotDist(to_f32(mean), unimix_ratio=unimix_ratio)
-
-
-def multi_onehot(mean, unimix_ratio, shape, **kwargs):
-    return MultiOneHotDist(to_f32(mean), shape, unimix_ratio=unimix_ratio)
 
 
 def binary(logits, **kwargs):
@@ -279,16 +164,8 @@ def symexp_twohot(logits, bin_num, **kwargs):
     return TwoHot(to_f32(logits), bins)
 
 
-def symlog_mse(logits, **kwargs):
-    return SymlogDist(to_f32(logits))
-
-
 def mse(logits, **kwargs):
     return MSEDist(to_f32(logits))
-
-
-def identity(logits, **kwargs):
-    return logits
 
 
 def kl(logits_left, logits_right):

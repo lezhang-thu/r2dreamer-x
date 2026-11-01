@@ -30,10 +30,8 @@ class OnlineTrainer:
     def eval(self, agent, train_step):
         """Run evaluation episodes.
 
-        For CPU-based environments (``ParallelEnv``), stepping is executed on
-        CPU and observations are moved to GPU asynchronously.  For GPU-resident
-        environments (``IsaacLabVecEnv``), no device transfer is needed —
-        ``.to()`` is a no-op when source and target devices match.
+        Atari environments step on CPU; observations are transferred to the
+        agent device for policy inference.
         """
         print("Evaluating the policy...")
         envs = self.eval_envs
@@ -49,7 +47,6 @@ class OnlineTrainer:
         returns = torch.zeros(envs.env_num,
                               dtype=torch.float32,
                               device=agent.device)
-        log_metrics = {}
         # cache is only used for video logging / open-loop prediction.
         cache = []
         agent_state = agent.get_initial_state(envs.env_num)
@@ -57,10 +54,7 @@ class OnlineTrainer:
         act = agent_state["prev_action"].clone()
         while not once_done.all():
             steps += ~done * ~once_done
-            # Step environments.  Each env backend handles device placement
-            # internally (ParallelEnv converts to CPU, IsaacLabVecEnv keeps
-            # on GPU).  The .to() calls below are no-ops when the data is
-            # already on agent.device.
+            # Step Atari on CPU and transfer observations to the agent device.
             # (B, A), (B,)
             trans, step_done = envs.step(act.detach(), done)
             # dict of (B, 1, *)
@@ -76,22 +70,12 @@ class OnlineTrainer:
             # (B, A)
             act, agent_state = agent.act(trans, agent_state, eval=True)
             returns += trans["reward"][:, 0] * ~once_done
-            for key, value in trans.items():
-                if key.startswith("log_"):
-                    if key not in log_metrics:
-                        log_metrics[key] = torch.zeros_like(returns)
-                    log_metrics[key] += value[:, 0] * ~once_done
             once_done |= done
         # dict of (B, T, *)
         cache = torch.stack(cache, dim=1) if len(cache) else None
         self.logger.scalar("episode/eval_score", returns.mean())
         self.logger.scalar("episode/eval_length",
                            steps.to(torch.float32).mean())
-        for key, value in log_metrics.items():
-            if key == "log_success":
-                value = torch.clip(
-                    value, max=1.0)  # make sure 1.0 for success episode
-            self.logger.scalar(f"episode/eval_{key[4:]}", value.mean())
         if cache is not None and "image" in cache:
             self.logger.video("eval_video", tools.to_np(cache["image"][:1]))
         if self.video_pred_log and cache is not None:
@@ -110,10 +94,8 @@ class OnlineTrainer:
     def begin(self, agent):
         """Main online training loop.
 
-        For CPU-based environments the loop overlaps CPU stepping and GPU
-        model execution via pinned-memory async H2D transfers.  For
-        GPU-resident environments (IsaacLab) no transfer is needed —
-        ``.to()`` is a no-op when the data is already on the target device.
+        Transfer Atari observations from CPU workers to the agent device
+        using pinned memory for asynchronous GPU transfers.
         """
         envs = self.train_envs
         video_cache = []
@@ -159,10 +141,7 @@ class OnlineTrainer:
                  ).sum()) * self._action_repeat  # step is based on env side
             lengths += ~done
 
-            # Step environments.  Each env backend handles device placement
-            # internally (ParallelEnv converts to CPU, IsaacLabVecEnv keeps
-            # on GPU).  The .to() calls below are no-ops when the data is
-            # already on agent.device.
+            # Step Atari on CPU and transfer observations to the agent device.
             # (B, A), (B,)
             trans, step_done = envs.step(act.detach(), done)
             # dict of (B, 1, *)

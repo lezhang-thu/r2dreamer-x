@@ -1,5 +1,4 @@
 import math
-import re
 from functools import partial
 
 import torch
@@ -111,131 +110,34 @@ class RMSNorm2D(nn.RMSNorm):
 
 
 class MultiEncoder(nn.Module):
+    """Encode Atari image observations."""
 
-    def __init__(
-        self,
-        config,
-        shapes,
-    ):
+    def __init__(self, config, shapes):
         super().__init__()
-        excluded = ("is_first", "is_last", "is_terminal", "reward")
-        shapes = {
-            k: v
-            for k, v in shapes.items()
-            if k not in excluded and not k.startswith("log_")
-        }
-        self.cnn_shapes = {
-            k: v
-            for k, v in shapes.items()
-            if len(v) == 3 and re.match(config.cnn_keys, k)
-        }
-        self.mlp_shapes = {
-            k: v
-            for k, v in shapes.items()
-            if len(v) in (1, 2) and re.match(config.mlp_keys, k)
-        }
-        print("Encoder CNN shapes:", self.cnn_shapes)
-        print("Encoder MLP shapes:", self.mlp_shapes)
-
-        self.out_dim = 0
-        self.selectors = []
-        self.encoders = []
-        if self.cnn_shapes:
-            input_ch = sum([v[-1] for v in self.cnn_shapes.values()])
-            input_shape = tuple(self.cnn_shapes.values())[0][:2] + (input_ch, )
-            self.encoders.append(ConvEncoder(config.cnn, input_shape))
-            self.selectors.append(
-                lambda obs: torch.cat([obs[k] for k in self.cnn_shapes], -1))
-            self.out_dim += self.encoders[-1].out_dim
-        if self.mlp_shapes:
-            inp_dim = sum([sum(v) for v in self.mlp_shapes.values()])
-            self.encoders.append(MLP(config.mlp, inp_dim))
-            self.selectors.append(
-                lambda obs: torch.cat([obs[k] for k in self.mlp_shapes], -1))
-            self.out_dim += self.encoders[-1].out_dim
-        self.encoders = nn.ModuleList(self.encoders)
-
-        if len(self.encoders) > 1:
-            self.fuser = lambda x: torch.cat(x, dim=-1)
-        elif len(self.encoders) == 1:
-            self.fuser = lambda x: x[0]
-        else:
-            raise NotImplementedError
-
+        # Retain the module path used by existing Atari checkpoints.
+        self.encoders = nn.ModuleList(
+            [ConvEncoder(config.cnn, shapes["image"])])
+        self.out_dim = self.encoders[0].out_dim
         self.apply(weight_init_)
 
     def forward(self, obs):
-        """Encode a dict of observations."""
-        # dict of (B, T, *)
-        return self.fuser(
-            [enc(sel(obs)) for enc, sel in zip(self.encoders, self.selectors)])
+        return self.encoders[0](obs["image"])
 
 
 class MultiDecoder(nn.Module):
+    """Decode Atari images for the Dreamer reconstruction objective."""
 
     def __init__(self, config, deter, flat_stoch, shapes):
         super().__init__()
-        excluded = ("is_first", "is_last", "is_terminal")
-        shapes = {k: v for k, v in shapes.items() if k not in excluded}
-        self.cnn_shapes = {
-            k: v
-            for k, v in shapes.items()
-            if len(v) == 3 and re.match(config.cnn_keys, k)
-        }
-        self.mlp_shapes = {
-            k: v
-            for k, v in shapes.items()
-            if len(v) in (1, 2) and re.match(config.mlp_keys, k)
-        }
-        print("Decoder CNN shapes:", self.cnn_shapes)
-        print("Decoder MLP shapes:", self.mlp_shapes)
-        self.all_keys = list(self.mlp_shapes.keys()) + list(
-            self.cnn_shapes.keys())
-
-        # Unlike the encoder, each decoder is initialized independently.
-        if self.cnn_shapes:
-            some_shape = list(self.cnn_shapes.values())[0]
-            shape = (sum(
-                x[-1] for x in self.cnn_shapes.values()), ) + some_shape[:-1]
-            self._cnn = ConvDecoder(
-                config.cnn,
-                deter,
-                flat_stoch,
-                shape,
-            )
-            self._image_dist = partial(
-                getattr(dists, str(config.cnn_dist.name)), **config.cnn_dist)
-        if self.mlp_shapes:
-            shape = (sum(sum(x) for x in self.mlp_shapes.values()), )
-            config.mlp.shape = shape
-            self._mlp = MLPHead(config.mlp, deter + flat_stoch)
-            self._mlp_dist = partial(getattr(dists, str(config.mlp_dist.name)),
-                                     **config.mlp_dist)
+        self.all_keys = ["image"]
+        height, width, channels = shapes["image"]
+        self._cnn = ConvDecoder(config.cnn, deter, flat_stoch,
+                                (channels, height, width))
+        self._image_dist = partial(getattr(dists, str(config.cnn_dist.name)),
+                                   **config.cnn_dist)
 
     def forward(self, stoch, deter):
-        """Decode latent states into observation distributions."""
-        # (B, T, S, K), (B, T, D)
-        dists = {}
-        if self.cnn_shapes:
-            split_sizes = [v[-1] for v in self.cnn_shapes.values()]
-            # (B, T, H, W, C_sum)
-            outputs = self._cnn(stoch, deter)
-            outputs = torch.split(outputs, split_sizes, -1)
-            dists.update({
-                key: self._image_dist(output)
-                for key, output in zip(self.cnn_shapes.keys(), outputs)
-            })
-        if self.mlp_shapes:
-            split_sizes = [v[0] for v in self.mlp_shapes.values()]
-            # (B, T, S*K + D)
-            feat = torch.cat([stoch.reshape(*deter.shape[:-1], -1), deter], -1)
-            outputs = self._mlp(feat)
-            outputs = torch.split(outputs, split_sizes, -1)
-            dists.update({
-                key: self._mlp_dist(output)
-                for key, output in zip(self.mlp_shapes.keys(), outputs)
-            })
-        return dists
+        return {"image": self._image_dist(self._cnn(stoch, deter))}
 
 
 class ConvEncoder(nn.Module):
@@ -383,7 +285,6 @@ class MLP(nn.Module):
     ):
         super().__init__()
         act = getattr(torch.nn, config.act)
-        self._symlog_inputs = bool(config.symlog_inputs)
         self._device = torch.device(config.device)
         self.layers = nn.Sequential()
         for i in range(config.layers):
@@ -398,8 +299,6 @@ class MLP(nn.Module):
 
     def forward(self, x):
         # (B, T, I)
-        if self._symlog_inputs:
-            x = dists.symlog(x)
         # (B, T, U)
         return self.layers(x)
 
@@ -413,32 +312,16 @@ class MLPHead(nn.Module):
         self._outscale = float(config.outscale)
         self._dist = getattr(dists, str(config.dist.name))
 
-        if self._dist_name == "bounded_normal":
-            self.last = nn.Linear(self.mlp.out_dim,
-                                  config.shape[0] * 2,
-                                  bias=True)
-            kwargs = {
-                "min_std": float(config.dist.min_std),
-                "max_std": float(config.dist.max_std)
-            }
-        elif self._dist_name == "onehot":
+        if self._dist_name == "onehot":
             self.last = nn.Linear(self.mlp.out_dim, config.shape[0], bias=True)
             kwargs = {"unimix_ratio": float(config.dist.unimix_ratio)}
-        elif self._dist_name == "multi_onehot":
-            self.last = nn.Linear(self.mlp.out_dim,
-                                  sum(config.shape),
-                                  bias=True)
-            kwargs = {
-                "unimix_ratio": float(config.dist.unimix_ratio),
-                "shape": tuple(config.shape)
-            }
         elif self._dist_name == "symexp_twohot":
             self.last = nn.Linear(self.mlp.out_dim, config.shape[0], bias=True)
             kwargs = {
                 "device": torch.device(config.device),
                 "bin_num": int(config.dist.bin_num)
             }
-        elif self._dist_name in ("binary", "identity"):
+        elif self._dist_name == "binary":
             self.last = nn.Linear(self.mlp.out_dim, config.shape[0], bias=True)
             kwargs = {}
         else:

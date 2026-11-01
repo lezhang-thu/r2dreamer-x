@@ -11,13 +11,6 @@ seed: ${seed}
 device: ${device}
 
 size: [64, 64]
-encoder:
-  mlp_keys: '$^'
-  cnn_keys: 'image'
-decoder:
-  mlp_keys: '$^'
-  cnn_keys: 'image'
-
 gray: False
 noops: 30
 lives: unused

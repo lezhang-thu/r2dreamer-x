@@ -31,8 +31,7 @@ class Dreamer(nn.Module):
         self.horizon = int(config.horizon)
         self.lamb = float(config.lamb)
         self.return_ema = networks.ReturnEMA(device=self.device)
-        self.act_dim = act_space.n if hasattr(act_space, "n") else sum(
-            act_space.shape)
+        self.act_dim = act_space.shape[0]
         self.rep_loss = str(config.rep_loss)
 
         # World model components
@@ -47,17 +46,7 @@ class Dreamer(nn.Module):
         self.reward = networks.MLPHead(config.reward, self.rssm.feat_size)
         self.cont = networks.MLPHead(config.cont, self.rssm.feat_size)
 
-        config.actor.shape = (act_space.n, ) if hasattr(
-            act_space, "n") else tuple(map(int, act_space.shape))
-        self.act_discrete = False
-        if hasattr(act_space, "multi_discrete"):
-            config.actor.dist = config.actor.dist.multi_disc
-            self.act_discrete = True
-        elif hasattr(act_space, "discrete"):
-            config.actor.dist = config.actor.dist.disc
-            self.act_discrete = True
-        else:
-            config.actor.dist = config.actor.dist.cont
+        config.actor.shape = (self.act_dim, )
 
         # Actor-critic components
         self.actor = networks.MLPHead(config.actor, self.rssm.feat_size)
