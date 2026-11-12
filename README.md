@@ -71,3 +71,9 @@ python test-consistency.py
 ```
 
 This replays the bundled `atari_MontezumaRevenge.pkl` dataset through `envs/atari.py` and checks cumulative rewards.
+
+## Unsupervised milestone extraction
+
+See [MILESTONES.md](MILESTONES.md) to replay color trajectories, train a
+skip-gram-style frame-pair classifier, and extract greedy sub-goals as PNGs
+with an 84×84 color MP4 for visual inspection.

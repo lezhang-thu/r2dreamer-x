@@ -1,5 +1,6 @@
 # Atari training outputs
 logdir/
+artifacts/milestones/
 *.hydra/
 torch_compile_debug/
 *.log
