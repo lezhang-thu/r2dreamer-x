@@ -14,7 +14,10 @@ def frames_to_tensor(frames, device="cpu"):
         raise ValueError(f"Expected [B,84,84,3] RGB frames, got {frames.shape}")
     if frames.dtype != np.uint8:
         raise ValueError(f"Expected uint8 frames in [0,255], got {frames.dtype}")
-    return torch.from_numpy(np.ascontiguousarray(frames)).to(
+    frames = np.ascontiguousarray(frames)
+    if not frames.flags.writeable:
+        frames = frames.copy()
+    return torch.from_numpy(frames).to(
         device=device, dtype=torch.float32
     ).permute(0, 3, 1, 2).contiguous().div_(255.0)
 

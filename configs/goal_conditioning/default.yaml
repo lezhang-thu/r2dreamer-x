@@ -1,0 +1,36 @@
+# Optional companion learner. Its interactions never enter Dreamer's replay/budget.
+enabled: False
+device: ${device}
+seed: 1000000
+recent_episodes: 32
+min_episodes: 2
+train_every_episodes: 2
+batch_size: 4
+classifier:
+  checkpoint: null
+  architecture: small
+  embedding_dim: 128
+  window: 5
+  batch_size: 64
+  learning_rate: 0.001
+  warmup_steps: 200
+  update_steps: 20
+  threshold: 0.5
+policy:
+  hidden_dim: 128
+  attention_heads: 4
+  mask_completed: True
+  learning_rate: 0.0003
+  gamma: 0.99
+  value_coef: 0.5
+  entropy_coef: 0.01
+  max_grad_norm: 0.5
+  rollout_steps: 32
+  max_steps: 4096
+evaluation:
+  episodes: 5
+  # Only source episodes ending in the last 20% of Dreamer's training budget.
+  recent_fraction: 0.2
+  max_steps: 27000
+  deterministic: True
+  save_video: True

@@ -1,6 +1,7 @@
 defaults:
   - env: atari100k
   - model: size12M
+  - goal_conditioning: default
   # Disable Hydra's Python logging-to-file (train.log)
   - override hydra/job_logging: disabled
   - _self_

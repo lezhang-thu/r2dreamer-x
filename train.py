@@ -48,15 +48,23 @@ def main(config):
         act_space,
     ).to(config.device)
 
+    goal_training = None
+    if config.goal_conditioning.enabled:
+        from goal_training import GoalTraining
+        goal_training = GoalTraining(config.goal_conditioning, config.env, logger,
+                                     logdir / "goal_conditioning")
+
     policy_trainer = OnlineTrainer(config.trainer, replay_buffer, logger,
-                                   train_envs, eval_envs)
-    policy_trainer.begin(agent)
+                                   train_envs, eval_envs, goal_training=goal_training)
+    final_step = policy_trainer.begin(agent)
 
     items_to_save = {
         "agent_state_dict": agent.state_dict(),
         "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
     }
     torch.save(items_to_save, logdir / "latest.pt")
+    if goal_training is not None:
+        goal_training.finish(final_step, policy_trainer.steps)
 
 
 if __name__ == "__main__":

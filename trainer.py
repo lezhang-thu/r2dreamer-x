@@ -6,7 +6,7 @@ import tools
 class OnlineTrainer:
 
     def __init__(self, config, replay_buffer, logger, train_envs,
-                 eval_envs):
+                 eval_envs, goal_training=None):
         self.replay_buffer = replay_buffer
         self.logger = logger
         self.train_envs = train_envs
@@ -24,6 +24,7 @@ class OnlineTrainer:
         self._should_log = tools.Every(config.update_log_every)
         self._should_eval = tools.Every(self.eval_every)
         self._action_repeat = config.action_repeat
+        self.goal_training = goal_training
 
     def eval(self, agent, train_step):
         """Run evaluation episodes.
@@ -114,6 +115,8 @@ class OnlineTrainer:
             # Step Atari on CPU and transfer observations to the agent device.
             # (B, A), (B,)
             trans, step_done = envs.step(act.detach(), done)
+            if self.goal_training is not None:
+                self.goal_training.observe(trans, step)
             # dict of (B, 1, *)
             trans = trans.to(agent.device, non_blocking=True)
             # (B,)
@@ -151,3 +154,7 @@ class OnlineTrainer:
                         self.logger.scalar(f"train/{name}", value)
                     self.logger.scalar("train/opt/updates", update_count)
                     self.logger.write(step, fps=True)
+            # Companion learning uses its own environments, replay, RNG, and counters.
+            if self.goal_training is not None:
+                self.goal_training.maybe_train(step)
+        return step

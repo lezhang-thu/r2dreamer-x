@@ -77,3 +77,7 @@ This replays the bundled `atari_MontezumaRevenge.pkl` dataset through `envs/atar
 See [MILESTONES.md](MILESTONES.md) to replay color trajectories, train a
 skip-gram-style frame-pair classifier, and extract greedy sub-goals as PNGs
 with an 84×84 color MP4 for visual inspection.
+
+For online classifier learning from R2-Dreamer's own trajectories and a
+separate recurrent goal-conditioned A2C agent, see
+[GOAL_TRAINING.md](GOAL_TRAINING.md). Launch with `bash runs/atari_goals.sh`.
