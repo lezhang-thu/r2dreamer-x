@@ -1,6 +1,7 @@
 """Two return rounds with real archive/bank logic and inexpensive model stand-ins."""
 
 import io
+from contextlib import redirect_stdout
 import json
 from pathlib import Path
 import pickle
@@ -128,7 +129,7 @@ class ReturnCycleTests(unittest.TestCase):
         recorder = EpisodeRecorder(self.frame(50), source='assisted')
         recorder.step(0, self.frame(51), 0.)
         recorder.step(1, self.frame(52), 0., terminated=True)
-        result = dict(interactions=2, return_actions=1, dreamer_actions=1,
+        result = dict(env_return=0., interactions=2, return_actions=1, dreamer_actions=1,
                       reached=True, takeover=True, reached_at=1,
                       anchor_indices=[1], rollout_anchor_count=1)
         return recorder.finish(), [self.cycle.round], np.array([[0.]], dtype=np.float32), result
@@ -158,12 +159,13 @@ class ReturnCycleTests(unittest.TestCase):
 
         classifier_module = SimpleNamespace(load_classifier=self.load_classifier, load_archive=self.load_archive)
         supervised_module = SimpleNamespace(prepare_demonstrations=self.demonstrations, GoalPolicy=FakePolicy)
+        output = io.StringIO()
         with patch.object(self.cycle, '_train', side_effect=self.train), \
                 patch('return_exploration.variant_modules', return_value=(classifier_module, supervised_module)), \
                 patch('return_exploration.collect_assisted_episode', side_effect=self.collect), \
                 patch('envs.make_env', side_effect=self.make_env), \
                 patch.object(AnchorBank, 'sample', new=sample), \
-                patch.object(AnchorBank, 'update', new=update):
+                patch.object(AnchorBank, 'update', new=update), redirect_stdout(output):
             self.cycle.run(self.agent, self.replay, ordinary_interactions=100)
             self.assertIs(self.cycle.recorder, paused)
             np.testing.assert_array_equal(np.stack(paused.frames), paused_frames)
@@ -225,6 +227,18 @@ class ReturnCycleTests(unittest.TestCase):
         self.assertEqual(self.cycle.policy_checkpoint, second / 'agent' / 'latest.pt')
         self.assertTrue(all(env.closed for env in self.environments))
         self.assertTrue(self.agent.training)
+        lines = output.getvalue().splitlines()
+        summaries = [line for line in lines if line.startswith('[return round ')]
+        self.assertEqual(summaries, [
+            f'[return round {round_number}] episode {episode}/2 return=0.00 '
+            'steps=2 reached=True takeover=True'
+            for round_number in (1, 2) for episode in (1, 2)])
+        events = [json.loads(line) for line in lines if line.startswith('{')]
+        self.assertEqual(len(events), 4)
+        self.assertTrue(all(event['env_return'] == 0. for event in events))
+        for directory in (first, second):
+            rollouts = json.loads((directory / 'rollouts.json').read_text())
+            self.assertEqual([row['env_return'] for row in rollouts], [0., 0.])
 
     def test_default_configuration_uses_fixed_100_episodes(self):
         config = OmegaConf.load(Path(__file__).resolve().parents[1] / 'configs' / 'configs.yaml')

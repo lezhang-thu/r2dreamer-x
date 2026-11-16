@@ -69,6 +69,7 @@ def collect_assisted_episode(agent, policy, classifier, env, goals, target,
     rollout_anchors, anchor_indices, rows = [], [], []
     reached_at = None
     interactions, return_actions = 0, 0
+    env_return = 0.
     while True:
         frame = resize_frame(observation['image'])
         current, classifier_hidden = classifier.encode_step(
@@ -104,13 +105,14 @@ def collect_assisted_episode(agent, policy, classifier, env, goals, target,
         if done:
             break
         observation, reward, done, _ = env.step(action[0].cpu().numpy())
+        env_return += float(reward)
         interactions += 1
         terminal = bool(observation['is_terminal'])
         recorder.step(int(action.argmax(-1).item()), observation['image'], reward,
                       terminated=terminal, truncated=bool(done and not terminal))
     references = (np.stack(rollout_anchors) if rollout_anchors else
                   np.empty((0, target.shape[-1]), dtype=np.float32))
-    result = dict(interactions=interactions, return_actions=return_actions,
+    result = dict(env_return=env_return, interactions=interactions, return_actions=return_actions,
                   dreamer_actions=interactions - return_actions, reached_at=reached_at,
                   reached=reached_at is not None, takeover=reached_at is not None and reached_at < interactions,
                   anchor_indices=anchor_indices, rollout_anchor_count=len(references))
@@ -251,6 +253,9 @@ class ReturnExploration:
                 episode, rows, references, result = collect_assisted_episode(
                     agent, policy, classifier, env, goals, bank.references[representative],
                     bank.threshold, -self.round, self.device)
+                print(f"[return round {self.round}] episode {index + 1}/{self.episodes} "
+                      f"return={result['env_return']:.2f} steps={result['interactions']} "
+                      f"reached={result['reached']} takeover={result['takeover']}", flush=True)
                 # Complete T enters replay before its counters affect the next draw.
                 for row in rows:
                     replay.add_transition(row)

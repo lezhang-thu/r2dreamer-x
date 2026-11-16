@@ -79,6 +79,11 @@ class Buffer:
         # Ordinary collection may arrive on GPU and complete assisted episodes
         # on CPU. Online windows must have one device before they are stacked.
         data = data.to(self.storage_device)
+        # TorchRL allocates storage from the first row and indexed writes require
+        # exact dtypes. Use one signed ID dtype for ordinary and assisted streams.
+        if data['episode'].dtype != torch.int64:
+            data = data.clone(recurse=False)
+            data['episode'] = data['episode'].to(torch.int64)
         coords = self._buffer.extend(data.unsqueeze(1))
         if self._online is not None:
             self._online.push(data, coords)

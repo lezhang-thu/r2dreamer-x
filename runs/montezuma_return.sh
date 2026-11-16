@@ -3,7 +3,8 @@ set -euo pipefail
 
 GPU_ID=${GPU_ID:-0}
 SEED=${SEED:-0}
-RUN_DIR=${RUN_DIR:-logdir/$(date +%Y%m%d_%H%M%S)_r2dreamer_return_montezuma_${SEED}}
+#RUN_DIR=${RUN_DIR:-logdir/$(date +%Y%m%d_%H%M%S)_r2dreamer_return_montezuma_${SEED}}
+RUN_DIR=${RUN_DIR:-logdir/$(date +%Y%m%d_%H%M%S)_r2dreamer_return_hero${SEED}}
 
 CUDA_VISIBLE_DEVICES="$GPU_ID" python train.py \
     env=atari_return \

@@ -87,7 +87,7 @@ class OnlineTrainer:
                               dtype=torch.int32,
                               device=agent.device)
         episode_ids = torch.arange(
-            envs.env_num, dtype=torch.int32, device=agent.device
+            envs.env_num, dtype=torch.int64, device=agent.device
         )  # Kept constant so short episodes (< batch_length) remain sampable; RSSM resets via is_first.
         train_metrics = tools.MetricAccumulator()
         agent_state = agent.get_initial_state(envs.env_num)

@@ -93,6 +93,12 @@ are logged separately. Startup NOOPs and evaluation interactions are outside
 these collection counters, as in the original trainer. The replay capacity is
 measured in stored observation rows, including episode-reset rows.
 
+Every assisted episode prints a summary immediately on completion, for example
+`[return round 1] episode 7/100 return=1200.00 steps=850 reached=True takeover=True`.
+The return sums environment rewards across the entire episode, including both
+controllers. It is also saved as `env_return` in each `return_episode` JSON log
+entry and in the round's `rollouts.json`.
+
 The integration currently requires one training environment, RGB observations,
 and complete-game episodes (`env.env_num=1`, `env.gray=False`,
 `env.lives=unused`). It shares the standard Atari preprocessing and action space;

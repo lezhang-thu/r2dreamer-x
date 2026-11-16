@@ -111,6 +111,7 @@ class ReturnRolloutTest(unittest.TestCase):
         np.testing.assert_array_equal(episode['actions'], env.actions)
         np.testing.assert_array_equal(episode['frames'][:, 0, 0, 0], pixels)
         np.testing.assert_array_equal(episode['rewards'], np.arange(1, len(pixels)))
+        self.assertEqual(result['env_return'], float(episode['rewards'].sum()))
         for index, row in enumerate(rows):
             self.assertEqual(int(row['episode'][0]), -7)
             self.assertEqual(int(row['image'][0, 0, 0, 0]), pixels[index])

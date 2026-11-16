@@ -9,14 +9,14 @@ from tensordict import TensorDict
 from buffer import Buffer, OnlineQueue
 
 
-def transition(segment, marker, first=False):
+def transition(segment, marker, first=False, episode_dtype=torch.int64):
     # Marker identifies an observation. Its action is the outgoing action, so
     # training on marker t must receive action (t - 1) + 0.25 after sampling.
     latent = segment * 1000 + marker
     return TensorDict({
         'observation': torch.tensor([[marker]]),
         'action': torch.tensor([[marker + 0.25]]),
-        'episode': torch.tensor([segment]),
+        'episode': torch.tensor([segment], dtype=episode_dtype),
         'is_first': torch.tensor([[first]]),
         'stoch': torch.full((1, 2, 2), float(latent)),
         'deter': torch.full((1, 2), float(latent)),
@@ -24,6 +24,55 @@ def transition(segment, marker, first=False):
 
 
 class ReturnReplayTests(unittest.TestCase):
+    def check_mixed_episode_dtypes(self, ordinary_device):
+        # The live trainer produces int32 segment IDs; assisted collection uses
+        # int64 negative IDs. Storage is allocated by the first ordinary row.
+        for online in (False, True):
+            with self.subTest(online=online, ordinary_device=ordinary_device):
+                torch.manual_seed(19)
+                replay = Buffer(SimpleNamespace(device=ordinary_device, storage_device='cpu',
+                                                batch_size=1, batch_length=2, max_size=32,
+                                                online=online, update_latents=False))
+                starts = {0: 0, -1: 100, 1: 200}
+                for segment, dtype, source_device in ((0, torch.int32, ordinary_device),
+                                                       (-1, torch.int64, 'cpu'),
+                                                       (1, torch.int32, ordinary_device)):
+                    for position in range(3):
+                        row = transition(segment, starts[segment] + position,
+                                         first=position == 0 and segment != 1,
+                                         episode_dtype=dtype).to(source_device)
+                        replay.add_transition(row)
+                        self.assertEqual(row['episode'].dtype, dtype,
+                                         'Replay canonicalization must not change the caller\'s row')
+                        self.assertEqual(int(row['episode'][0]), segment)
+
+                def check_sample():
+                    data, _, _ = replay.sample()
+                    self.assertEqual(data['episode'].dtype, torch.int64)
+                    self.assertEqual(data['episode'].device.type, ordinary_device)
+                    segment = int(data['episode'][0, 0])
+                    self.assertIn(segment, starts)
+                    self.assertTrue(bool((data['episode'] == segment).all()))
+                    markers = data['observation'][0, :, 0]
+                    torch.testing.assert_close(markers, torch.tensor(
+                        [starts[segment] + 1, starts[segment] + 2], device=ordinary_device))
+                    torch.testing.assert_close(data['action'][0, :, 0], markers.float() - .75)
+                    return segment
+
+                if online:
+                    # The two newest windows contain the negative assisted ID
+                    # and the resumed ordinary ID, with canonical dtypes on both.
+                    self.assertEqual(check_sample(), -1)
+                    self.assertEqual(check_sample(), 1)
+                self.assertEqual({check_sample() for _ in range(64)}, {0, -1, 1})
+
+    def test_mixed_ordinary_and_assisted_episode_dtypes(self):
+        self.check_mixed_episode_dtypes('cpu')
+
+    @unittest.skipUnless(torch.cuda.is_available(), 'CUDA is unavailable in this test process')
+    def test_gpu_ordinary_and_cpu_assisted_rows_with_mixed_episode_dtypes(self):
+        self.check_mixed_episode_dtypes('cuda')
+
     def test_online_windows_discard_partial_segments_at_interruption(self):
         queue = OnlineQueue(window=4, max_windows=10)
         row = 0
