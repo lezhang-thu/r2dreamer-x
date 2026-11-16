@@ -45,6 +45,7 @@ do
     do
         CUDA_VISIBLE_DEVICES=$GPU_ID python train.py \
             env=atari100k \
+            return_exploration.enabled=False \
             env.task=$task \
             logdir=logdir/${DATE}_${METHOD}_${task#atari_}_$seed \
             model.compile=True \

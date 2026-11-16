@@ -1,0 +1,9 @@
+defaults:
+  - atari100k
+  - _self_
+
+task: atari_montezuma_revenge
+# The existing trainer counts action-repeat frames: 50m interactions * 4.
+steps: 200000000
+action_repeat: 4
+env_num: 1

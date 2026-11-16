@@ -1,5 +1,5 @@
 defaults:
-  - env: atari100k
+  - env: atari_return
   - model: size12M
   # Disable Hydra's Python logging-to-file (train.log)
   - override hydra/job_logging: disabled
@@ -20,7 +20,7 @@ batch_length: 64
 buffer:
   batch_size: ${batch_size}
   batch_length: ${batch_length}
-  max_size: 5e5
+  max_size: 1000000
   device: ${device}
   #storage_device: ${device}
   storage_device: 'cpu'
@@ -37,3 +37,24 @@ trainer:
   train_ratio: ${env.train_ratio}
   update_log_every: 5e3
   action_repeat: ${env.action_repeat}
+
+return_exploration:
+  enabled: True
+  # Ordinary collection only; return-and-explore interactions are counted separately.
+  interval: 100000
+  episodes: 100
+  initial_policy: null
+  classifier:
+    architecture: resnet18
+    visual_steps: 5000
+    gru_steps: 5000
+    window: 20
+    batch_size: 64
+    eval_every: 250
+    eval_pairs: 512
+    tbptt_chunk: 0
+  policy:
+    updates: 10000
+    batch_size: 4
+    unroll_length: 2048
+    score_every: 1000

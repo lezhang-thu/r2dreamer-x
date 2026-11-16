@@ -24,6 +24,7 @@ class OnlineTrainer:
         self._should_log = tools.Every(config.update_log_every)
         self._should_eval = tools.Every(self.eval_every)
         self._action_repeat = config.action_repeat
+        self.return_exploration = None
 
     def eval(self, agent, train_step):
         """Run evaluation episodes.
@@ -114,6 +115,9 @@ class OnlineTrainer:
             # Step Atari on CPU and transfer observations to the agent device.
             # (B, A), (B,)
             trans, step_done = envs.step(act.detach(), done)
+            if self.return_exploration is not None:
+                self.return_exploration.record_ordinary(
+                    trans, act, done, step_done, step // self._action_repeat)
             # dict of (B, 1, *)
             trans = trans.to(agent.device, non_blocking=True)
             # (B,)
@@ -127,7 +131,7 @@ class OnlineTrainer:
                                          eval=False)
 
             # Store transition.
-            # We keep the observation and the action that produced it together.
+            # Store the outgoing action; Buffer.sample shifts it back one step.
             # Mask actions after an episode has ended.
             trans["action"] = act * ~done.unsqueeze(-1)
             trans["stoch"] = agent_state["stoch"]
@@ -151,3 +155,17 @@ class OnlineTrainer:
                         self.logger.scalar(f"train/{name}", value)
                     self.logger.scalar("train/opt/updates", update_count)
                     self.logger.write(step, fps=True)
+            if self.return_exploration is not None:
+                interactions = step // self._action_repeat
+                if (self.return_exploration.due(interactions)
+                        and self.return_exploration.run(agent, self.replay_buffer, interactions)):
+                    # Auxiliary rows interrupt the ordinary stream in storage.
+                    # Keep the live state/action, but give its resumed rows a new
+                    # replay segment so samples cannot cross this interruption.
+                    episode_ids += 1
+                    self.logger.scalar('return/assisted_interactions',
+                                       self.return_exploration.assisted_interactions)
+                    self.logger.scalar('return/ordinary_interactions', interactions)
+                    self.logger.scalar('return/total_interactions',
+                                       interactions + self.return_exploration.assisted_interactions)
+                    self.logger.write(step)

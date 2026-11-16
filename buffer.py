@@ -16,6 +16,7 @@ class OnlineQueue:
     def __init__(self, window, max_windows):
         self.window = int(window)
         self._pending = {}
+        self._segments = {}
         # Keep at most two training batches; drop the oldest windows if collection
         # outruns training so the queue cannot grow without bound.
         self.queue = deque(maxlen=int(max_windows))
@@ -24,6 +25,12 @@ class OnlineQueue:
         # env identity is the row position in `data`; coords only says where it landed
         where = {int(env): int(row) for row, env in coords.tolist()}
         for env in range(data.batch_size[0]):
+            segment = int(data['episode'][env])
+            if self._segments.get(env) != segment:
+                # A paused stream may resume after an auxiliary collection phase.
+                # Never construct a window across that discontinuity.
+                self._pending[env] = []
+                self._segments[env] = segment
             pending = self._pending.setdefault(env, [])
             pending.append((data[env].clone(), where[env]))
             if len(pending) == self.window:
@@ -69,6 +76,9 @@ class Buffer:
     def add_transition(self, data):
         # This is batched data and lifted for storage.
         # (B, ...) -> (B, 1, ...)
+        # Ordinary collection may arrive on GPU and complete assisted episodes
+        # on CPU. Online windows must have one device before they are stacked.
+        data = data.to(self.storage_device)
         coords = self._buffer.extend(data.unsqueeze(1))
         if self._online is not None:
             self._online.push(data, coords)

@@ -50,6 +50,12 @@ def main(config):
 
     policy_trainer = OnlineTrainer(config.trainer, replay_buffer, logger,
                                    train_envs, eval_envs)
+    if config.return_exploration.enabled:
+        from return_exploration import ReturnExploration
+        action_meanings = train_envs.envs[0].get_wrapper_attr('_action_meanings')()
+        policy_trainer.return_exploration = ReturnExploration(
+            config.return_exploration, config.env, logdir, act_space.shape[0], config.device,
+            action_meanings=action_meanings)
     policy_trainer.begin(agent)
 
     items_to_save = {
