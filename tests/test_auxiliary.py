@@ -120,3 +120,107 @@ def test_finetune_and_resume_cannot_be_combined():
     with pytest.raises(SystemExit):
         supervised.parse_args(['train', '--archive', 'a', '--classifier', 'c', '--output', 'o',
                                '--resume', 'old', '--finetune', 'old'])
+
+
+def test_in_process_classifier_shares_frames_and_never_reloads_files(tmp_path, monkeypatch):
+    frames = np.full((3, 84, 84, 3), 10, dtype=np.uint8)
+    frames.setflags(write=False)
+    episodes = [dict(id=7, frames=frames, actions=np.array([0, 1]), complete=True)]
+    args = classifier.parse_args(['--output', str(tmp_path / 'classifier.pt'), '--all-data',
+        '--architecture', 'small', '--embedding-dim', '8', '--hidden-dim', '8',
+        '--visual-steps', '1', '--gru-steps', '1', '--batch-size', '2', '--eval-pairs', '2',
+        '--device', 'cpu', '--threads', '1', '--seed', '3'], require_archive=False)
+    cache = classifier.cache_features
+    observed = []
+
+    def check_shared(model, sequences, device, **kwargs):
+        observed.extend(sequences)
+        return cache(model, sequences, device, **kwargs)
+
+    def unexpected_read(*args, **kwargs):
+        raise AssertionError('In-process classifier must use its inputs and live best weights')
+
+    monkeypatch.setattr(classifier, 'cache_features', check_shared)
+    monkeypatch.setattr(classifier, 'load_archive', unexpected_read)
+    monkeypatch.setattr(torch, 'load', unexpected_read)
+    model, checkpoint = classifier.train_from_episodes(args, episodes, {}, 'a' * 64)
+    assert len(observed) == 1
+    assert observed[0] is frames
+    assert checkpoint['archive_sha256'] == 'a' * 64
+    assert checkpoint['model_fingerprint'] == classifier.model_fingerprint(model)
+    assert not model.training and all(not p.requires_grad for p in model.parameters())
+    assert not list(tmp_path.rglob('*.pkl')) and not list(tmp_path.rglob('*.npz'))
+
+
+def test_live_policy_reuses_optimizer_and_latest_weights_without_checkpoint_reads(tmp_path, monkeypatch):
+    model = classifier.RecurrentClassifier('small', 8, 8)
+    with torch.no_grad():
+        model.head[-1].weight.zero_()
+        model.head[-1].bias.fill_(-10.)
+    model.eval().requires_grad_(False)
+    metadata = dict(num_actions=2, action_meanings=['NOOP', 'FIRE'], env_config=dict(task='atari_test'))
+    checkpoint = dict(archive_sha256='a' * 64, training_episode_ids=[7], evaluation_episode_ids=[], threshold=.5)
+    frames = np.full((3, 84, 84, 3), 20, dtype=np.uint8)
+    actions = np.array([0, 1])
+    frames.setflags(write=False)
+    actions.setflags(write=False)
+    demos = supervised.prepare_demonstrations(
+        [dict(id=7, frames=frames, actions=actions, complete=True)], [7], model, .5)
+    assert demos[0]['frames'] is frames
+
+    def arguments(output):
+        return supervised.parse_args(['train', '--output', str(output), '--device', 'cpu',
+            '--threads', '1', '--seed', '13', '--hidden-dim', '8', '--attention-heads', '2',
+            '--batch-size', '1', '--unroll-length', '2', '--updates', '1', '--score-every', '1'],
+            require_inputs=False)
+
+    def unexpected_read(*args, **kwargs):
+        raise AssertionError('Live policy continuation must not read a checkpoint or archive')
+
+    initial = []
+    original_save = supervised.save_checkpoint
+
+    def capture_initial(path, payload):
+        if payload['update'] == 0 and path.name == 'latest.pt':
+            initial.append(copy.deepcopy(payload))
+        original_save(path, payload)
+
+    # Select the initial policy as best, ensuring next-round fitting must use
+    # the updated latest policy rather than accidentally continuing the rollout.
+    scores = iter([1., 0., 1., 0.])
+    monkeypatch.setattr(supervised, 'score_training', lambda *args: dict(action_accuracy=next(scores), loss=0.))
+    monkeypatch.setattr(supervised, 'save_checkpoint', capture_initial)
+    monkeypatch.setattr(supervised, 'load_archive', unexpected_read)
+    monkeypatch.setattr(torch, 'load', unexpected_read)
+    state, rollout = supervised.train_from_demonstrations(
+        arguments(tmp_path / 'first'), model, checkpoint, metadata, demos, 'b' * 64)
+    policy, optimizer = state.policy, state.optimizer
+    previous_weights = classifier.copy_model_state(policy)
+    previous_optimizer = copy.deepcopy(optimizer.state_dict())
+    assert any(not torch.equal(previous_weights[key], initial[0]['model_state'][key]) for key in previous_weights)
+    for key, value in rollout.state_dict().items():
+        assert torch.equal(value, initial[0]['model_state'][key])
+    assert rollout is not policy and not rollout.training
+    assert all(not p.requires_grad for p in rollout.parameters())
+    assert state.metadata['optimizer_continuation'] == 'new'
+    previous_path, previous_hash = state.checkpoint_path, state.checkpoint_sha256
+    state.to('cpu')
+    # An in-memory continuation must not even instantiate a replacement policy.
+    monkeypatch.setattr(supervised.GoalPolicy, '__init__', unexpected_read)
+    checkpoint = checkpoint | dict(archive_sha256='c' * 64)
+    continued, _ = supervised.train_from_demonstrations(
+        arguments(tmp_path / 'second'), model, checkpoint, metadata, demos, 'd' * 64, state=state)
+    assert continued is state and state.policy is policy and state.optimizer is optimizer
+    assert state.total_updates == 2
+    assert state.metadata['previous_training_updates'] == 1
+    assert state.metadata['optimizer_continuation'] == 'memory'
+    assert state.metadata['finetuned_from'] == str(previous_path)
+    assert state.metadata['finetuned_from_sha256'] == previous_hash
+    for key, value in previous_weights.items():
+        assert torch.equal(value, initial[1]['model_state'][key])
+    for key, values in previous_optimizer['state'].items():
+        for name, value in values.items():
+            assert torch.equal(value, initial[1]['optimizer_state']['state'][key][name])
+    assert all(int(values['step']) == 2 for values in optimizer.state.values())
+    assert optimizer.param_groups[0]['lr'] == 3e-4
+    assert not list(tmp_path.rglob('*.pkl')) and not list(tmp_path.rglob('*.npz'))

@@ -67,6 +67,19 @@ class AnchorBankTests(unittest.TestCase):
         bank.update(np.array([[0.]]))
         np.testing.assert_allclose(bank.probabilities(), [1 / 3, 2 / 3])
 
+    def test_uniform_occurrences_include_long_prefixes_and_repeated_source_episodes(self):
+        prefixes = [(10, 0), (10, 3), (10, 7), (20, 0)]
+        bank = AnchorBank(np.array([[0.]]), [4], [prefixes], [(10, 0)],
+                          lambda left, right: np.ones((len(left), len(right))))
+        rng = np.random.default_rng(7)
+        counts = dict.fromkeys(prefixes, 0)
+        for _ in range(4000):
+            _, prefix = bank.sample(rng)
+            counts[prefix] += 1
+        # Each matching occurrence has equal weight, independent of prefix
+        # length or how many matching occurrences its source episode supplies.
+        np.testing.assert_allclose(np.array(list(counts.values())) / 4000, .25, atol=.03)
+
     def test_exact_origin_is_available_when_self_similarity_fails(self):
         bank = AnchorBank.build([dict(id=5, references=np.array([[7.]]))],
                                 lambda left, right: np.zeros((len(left), len(right))))

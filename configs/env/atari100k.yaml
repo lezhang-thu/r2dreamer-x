@@ -1,8 +1,8 @@
 task: atari_alien
 steps: 4.1e5
 env_num: 1
-#eval_episode_num: 100
-eval_episode_num: 10
+# Retained for config compatibility; training creates no evaluation workers.
+eval_episode_num: 0
 action_repeat: 4
 train_ratio: 128
 time_limit: 108000

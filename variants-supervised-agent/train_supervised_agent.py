@@ -7,6 +7,8 @@ classifier, similarity-based anchor LCS, and complete environment episodes.
 
 import argparse
 import collections
+import copy
+from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
@@ -21,7 +23,7 @@ from torch.nn import functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence, pad_sequence
 from torch.utils.checkpoint import checkpoint as recompute
 
-from train_gru_classifier import (encode_trajectory, file_sha256, frames_to_tensor,
+from train_gru_classifier import (copy_model_state, encode_trajectory, file_sha256, frames_to_tensor,
                                   load_archive, load_classifier, make_encoder,
                                   model_fingerprint)
 
@@ -196,7 +198,7 @@ def segment_logits(policy, demos, segments):
     features = features_for([d['frames'][start:start+size] for d, start, size in zip(selected, starts, sizes)])
     labels = torch.full(features.shape[:2], -100, dtype=torch.long, device=policy.device)
     for row, (d, start, size) in enumerate(zip(selected, starts, sizes)):
-        labels[row, :size] = torch.as_tensor(d['actions'][start:start+size], device=policy.device)
+        labels[row, :size] = torch.tensor(d['actions'][start:start+size], device=policy.device)
     logits, _ = policy.unroll(features, memory, lengths, sizes, hidden.detach())
     return logits, labels
 
@@ -227,10 +229,55 @@ def load_inputs(archive, classifier_path, device):
     return classifier, checkpoint, episodes, metadata
 
 
+@dataclass
+class PolicyTrainingState:
+    """Live policy and optimizer carried between online return cycles."""
+
+    policy: GoalPolicy
+    optimizer: torch.optim.Optimizer
+    metadata: dict
+    update: int
+    checkpoint_path: Path
+    checkpoint_sha256: str
+
+    @property
+    def total_updates(self):
+        return self.metadata.get('previous_training_updates', 0) + self.update
+
+    def to(self, device):
+        """Offload idle state or restore it without recreating the optimizer."""
+        self.policy.to(device)
+        for group in self.optimizer.param_groups:
+            device_step = group.get('capturable', False) or group.get('fused', False)
+            for parameter in group['params']:
+                for name, value in self.optimizer.state[parameter].items():
+                    if torch.is_tensor(value):
+                        target = device if name != 'step' or device_step else 'cpu'
+                        self.optimizer.state[parameter][name] = value.to(target)
+        return self
+
+
 def train(args):
+    """Standalone archive/checkpoint adapter around the in-process trainer."""
+    classifier, checkpoint, episodes, metadata = load_inputs(args.archive, args.classifier, args.device)
+    demos = prepare_demonstrations(episodes, checkpoint['training_episode_ids'], classifier,
+                                  checkpoint['threshold'], args.device,
+                                  skip_empty=getattr(args, 'skip_empty_anchors', False))
+    return train_from_demonstrations(args, classifier, checkpoint, metadata, demos,
+                                      file_sha256(args.classifier))
+
+
+def train_from_demonstrations(args, classifier, classifier_ckpt, metadata, demos,
+                              classifier_sha256, state=None):
+    """Train on shared demonstrations, continuing live weights and Adam state.
+
+    A standalone initial checkpoint may be loaded once. Subsequent online
+    rounds use ``state`` directly and never reload models or trajectory data.
+    """
     finetune = getattr(args, 'finetune', None)
     require(not (args.resume and finetune), '--resume and --finetune are mutually exclusive')
-    classifier, classifier_ckpt, episodes, metadata = load_inputs(args.archive, args.classifier, args.device)
+    require(state is None or not (args.resume or finetune),
+            'Use either live training state or a checkpoint continuation')
     require(args.updates > 0 and args.batch_size > 0 and args.unroll_length > 0 and args.score_every > 0,
             'Training counts must be positive')
     require(math.isfinite(args.learning_rate) and args.learning_rate > 0, 'Learning rate must be positive')
@@ -247,44 +294,58 @@ def train(args):
     rng = np.random.default_rng(seed)
     count = args.num_actions if args.num_actions is not None else metadata.get('num_actions')
     require(type(count) is int and count > 0, 'Archive needs num_actions metadata, or provide --num-actions')
-    demos = prepare_demonstrations(episodes, classifier_ckpt['training_episode_ids'], classifier,
-                                  classifier_ckpt['threshold'], args.device,
-                                  skip_empty=getattr(args, 'skip_empty_anchors', False))
+    require(bool(demos), 'Need at least one usable demonstration')
     require(all(np.all((d['actions'] >= 0) & (d['actions'] < count)) for d in demos), 'Action label outside action space')
-    policy = GoalPolicy(count, args.hidden_dim, args.attention_heads).to(args.device)
-    optimizer = torch.optim.AdamW(policy.parameters(), lr=args.learning_rate, weight_decay=0.)
+    if state is None:
+        policy = GoalPolicy(count, args.hidden_dim, args.attention_heads).to(args.device)
+        optimizer = torch.optim.AdamW(policy.parameters(), lr=args.learning_rate, weight_decay=0.)
+    else:
+        require(state.policy.model_config == dict(num_actions=count, hidden_dim=args.hidden_dim,
+                                                  attention_heads=args.attention_heads),
+                'Live policy has another model configuration')
+        state.to(args.device)
+        policy, optimizer = state.policy, state.optimizer
     segments = [(i, s, min(args.unroll_length, len(d['actions']) - s)) for i, d in enumerate(demos)
                 for s in range(0, len(d['actions']), args.unroll_length)]
     order, cursor, update, labels_seen, best = rng.permutation(len(segments)).tolist(), 0, 0, 0, None
-    provenance = dict(archive_sha256=classifier_ckpt['archive_sha256'], classifier_sha256=file_sha256(args.classifier),
+    provenance = dict(archive_sha256=classifier_ckpt['archive_sha256'], classifier_sha256=classifier_sha256,
         classifier_fingerprint=model_fingerprint(classifier), threshold=classifier_ckpt['threshold'],
         training_episode_ids=classifier_ckpt['training_episode_ids'], evaluation_episode_ids=classifier_ckpt['evaluation_episode_ids'],
         usable_training_episode_ids=[d['id'] for d in demos], env_config=metadata.get('env_config'),
         skipped_empty_episode_ids=sorted(set(classifier_ckpt['training_episode_ids']) - {d['id'] for d in demos}),
         action_meanings=metadata.get('action_meanings'), seed=seed,
+        optimizer_continuation='memory' if state is not None else ('checkpoint' if finetune or args.resume else 'new'),
         training_config=dict(batch_size=args.batch_size, unroll_length=args.unroll_length, learning_rate=args.learning_rate))
-    if finetune:
-        saved = torch.load(finetune, map_location='cpu', weights_only=True)
-        require(saved.get('kind') == 'standalone_goal_bc' and saved.get('format_version') == 2,
-                'Fine-tuning needs a version 2 all-anchor policy checkpoint')
-        require(saved['model_config'] == policy.model_config, 'Fine-tune checkpoint has another model configuration')
-        previous = saved['metadata']
+    if finetune or state is not None:
+        if state is None:
+            saved = torch.load(finetune, map_location='cpu', weights_only=True)
+            require(saved.get('kind') == 'standalone_goal_bc' and saved.get('format_version') == 2,
+                    'Fine-tuning needs a version 2 all-anchor policy checkpoint')
+            require(saved['model_config'] == policy.model_config, 'Fine-tune checkpoint has another model configuration')
+            previous = saved['metadata']
+            policy.load_state_dict(saved['model_state'])
+            optimizer.load_state_dict(saved['optimizer_state'])
+            previous_updates = previous.get('previous_training_updates', 0) + saved['update']
+            previous_path, previous_hash = Path(finetune).resolve(), file_sha256(finetune)
+            del saved
+        else:
+            previous = state.metadata
+            previous_updates = state.total_updates
+            previous_path, previous_hash = state.checkpoint_path, state.checkpoint_sha256
         if previous.get('action_meanings') is not None and metadata.get('action_meanings') is not None:
             require(previous['action_meanings'] == metadata['action_meanings'], 'Fine-tuning changed the action mapping')
         previous_task = (previous.get('env_config') or {}).get('task')
         current_task = (metadata.get('env_config') or {}).get('task')
         require(previous_task is None or current_task is None or previous_task == current_task,
                 'Fine-tuning changed the environment task')
-        policy.load_state_dict(saved['model_state'])
-        optimizer.load_state_dict(saved['optimizer_state'])
         for group in optimizer.param_groups:
             group['lr'] = args.learning_rate
-        provenance.update(finetuned_from=str(Path(finetune).resolve()),
-                          finetuned_from_sha256=file_sha256(finetune),
-                          previous_training_updates=previous.get('previous_training_updates', 0) + saved['update'])
+        provenance.update(finetuned_from=str(previous_path),
+                          finetuned_from_sha256=previous_hash,
+                          previous_training_updates=previous_updates)
         # A new dataset/classifier gets a fresh sampling schedule and fit score.
         # Model parameters and Adam moments retain their learned values.
-        del saved
+    best_weights = None
     if args.resume:
         saved = torch.load(args.resume, map_location='cpu', weights_only=True)
         require(saved.get('kind') == 'standalone_goal_bc' and saved.get('format_version') == 2,
@@ -311,6 +372,9 @@ def train(args):
         if len(rows) != len(retained):
             log_path.rename(output / f'training.interrupted_{time.time_ns()}.jsonl')
             log_path.write_text(''.join(json.dumps(row) + '\n' for row in retained))
+        # Standalone resume can retain a best fit from before its latest state.
+        best_weights = torch.load(output / 'best.pt', map_location='cpu', weights_only=True)['model_state']
+        provenance['optimizer_continuation'] = 'checkpoint'
 
     def payload():
         return dict(kind='standalone_goal_bc', format_version=2, model_config=policy.model_config,
@@ -321,12 +385,13 @@ def train(args):
                     cuda_rng_state=torch.cuda.get_rng_state(args.device) if args.device.startswith('cuda') else None)
 
     def assess():
-        nonlocal best
+        nonlocal best, best_weights
         result = score_training(policy, demos, args.unroll_length)
         quality = [result['action_accuracy'], -result['loss']]
         if best is None or tuple(quality) > tuple(best):
             best = quality
             save_checkpoint(output / 'best.pt', payload())
+            best_weights = copy_model_state(policy)
         print(json.dumps(dict(event='train_fit', update=update, **result)), flush=True)
         save_checkpoint(output / 'latest.pt', payload())
         return result
@@ -366,6 +431,19 @@ def train(args):
     save_json(output / 'training_report.json', dict(update=update, labels_seen=labels_seen, train_fit=fit,
               best_score=best, training_environment_steps=0, heldout_labels_used=False,
               classifier_unchanged=True, checkpoint=str(output / 'best.pt')))
+    optimizer.zero_grad(set_to_none=True)
+    # Rollouts use the best fit, while future updates continue the latest fit.
+    rollout_policy = copy.deepcopy(policy)
+    rollout_policy.load_state_dict(best_weights)
+    rollout_policy.eval().requires_grad_(False)
+    checkpoint_path = (output / 'latest.pt').resolve()
+    if state is None:
+        state = PolicyTrainingState(policy, optimizer, provenance, update,
+                                    checkpoint_path, file_sha256(checkpoint_path))
+    else:
+        state.metadata, state.update = provenance, update
+        state.checkpoint_path, state.checkpoint_sha256 = checkpoint_path, file_sha256(checkpoint_path)
+    return state, rollout_policy
 
 
 class AtariEnv:
@@ -657,13 +735,13 @@ def evaluate(args):
         env.close()
 
 
-def parse_args(argv=None):
+def parse_args(argv=None, *, require_inputs=True):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
     for name in ('train', 'evaluate'):
         sub = commands.add_parser(name)
-        sub.add_argument('--archive', type=Path, required=True)
-        sub.add_argument('--classifier', type=Path, required=True)
+        sub.add_argument('--archive', type=Path, required=require_inputs)
+        sub.add_argument('--classifier', type=Path, required=require_inputs)
         sub.add_argument('--output', type=Path, required=True)
         sub.add_argument('--device', default='auto')
         sub.add_argument('--threads', type=int, default=4)

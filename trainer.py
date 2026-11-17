@@ -13,8 +13,6 @@ class OnlineTrainer:
         self.eval_envs = eval_envs
         self.steps = int(config.steps)
         self.pretrain = int(config.pretrain)
-        self.eval_every = int(config.eval_every)
-        self.eval_episode_num = int(config.eval_episode_num)
         self.batch_length = int(config.batch_length)
         batch_steps = int(config.batch_size * config.batch_length)
         # train_ratio is based on data steps rather than environment steps.
@@ -22,12 +20,11 @@ class OnlineTrainer:
                                            config.action_repeat)
         self._should_pretrain = tools.Once()
         self._should_log = tools.Every(config.update_log_every)
-        self._should_eval = tools.Every(self.eval_every)
         self._action_repeat = config.action_repeat
         self.return_exploration = None
 
     def eval(self, agent, train_step):
-        """Run evaluation episodes.
+        """Run evaluation episodes only when explicitly called.
 
         Atari environments step on CPU; observations are transferred to the
         agent device for policy inference.
@@ -94,11 +91,6 @@ class OnlineTrainer:
         # (B, A)
         act = agent_state["prev_action"].clone()
         while step < self.steps:
-            # Evaluation
-            if self._should_eval(
-                    step
-            ) and self.eval_episode_num > 0 and self.eval_envs is not None:
-                self.eval(agent, step)
             # Save metrics
             if done.any():
                 for i, d in enumerate(done):

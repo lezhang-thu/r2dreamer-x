@@ -56,28 +56,35 @@ bash runs/montezuma_return.sh
 Hydra overrides can be passed after the script, for example
 `bash runs/montezuma_return.sh model.compile=False`.
 
+Periodic Dreamer evaluation is disabled. Training creates only its training
+environment workers; it does not construct evaluation environments, even when
+an older configuration specifies a positive `env.eval_episode_num`.
+
 Every 100,000 **ordinary** interactions, learning pauses for one return phase:
 
-1. Snapshot completed episodes since the preceding snapshot. After the first
+1. Select completed episodes since the preceding return phase. After the first
    phase this includes its 100 assisted episodes and newly completed ordinary
    episodes. An unfinished ordinary episode stays alive and is included only
-   in a later snapshot after it ends. Evaluation episodes are never included.
-2. Fit a fresh classifier on all snapshot episodes: ResNet-18, 5,000 visual
+   in a later source set after it ends.
+2. Fit a fresh classifier on all source episodes: ResNet-18, 5,000 visual
    updates, 5,000 GRU updates, temporal window 20. Unlike standalone evaluation,
    this mode has no held-out episodes; checkpoint-selection diagnostics use
    training episodes.
 3. Train the return policy for 10,000 additional updates, batch size 4, unroll
-   length 2,048. Later phases retain the preceding `latest.pt` policy parameters
-   **and Adam state**. The first phase initializes a new policy unless
+   length 2,048. Later phases continue with the same policy parameters
+   **and AdamW optimizer state in memory**. The first phase initializes a new policy unless
    `return_exploration.initial_policy=/path/to/agent/latest.pt` is supplied.
-   The best training-fit checkpoint in the current phase controls rollouts.
+   A separate copy of the best training-fit weights controls rollouts; the
+   latest weights and optimizer state remain the next cycle's starting point.
 4. Build representative anchors in source order. Every similar representative
    gets its counter incremented; a new representative is added only when none
    match. Precompute all matching source prefixes against the completed set.
 5. Generate **exactly 100 complete assisted episodes**, independently of the
-   snapshot size. Choose a representative with probability proportional to
-   `1 / count`, then uniformly choose a matching source prefix through its
-   anchor. The return policy gets that sequence of anchor images. At every
+   source-set size. Choose a representative with probability proportional to
+   `1 / count`, then uniformly sample one of its matching source prefixes,
+   including the target anchor. Each matching occurrence has equal probability,
+   regardless of prefix length. The return policy gets that sequence of anchor
+   images. At every
    observation, classifier similarity to the sampled representative at least
    0.5 triggers Dreamer takeover without resetting the environment. Dreamer
    observes the actual live history and executed actions throughout the return
@@ -89,8 +96,8 @@ Every 100,000 **ordinary** interactions, learning pauses for one return phase:
 
 Assisted interactions, including Dreamer takeovers, **do not advance** the 100k
 clock or the 50m ordinary-interaction budget. Their count and the combined count
-are logged separately. Startup NOOPs and evaluation interactions are outside
-these collection counters, as in the original trainer. The replay capacity is
+are logged separately. Startup NOOPs are outside these collection counters,
+as in the original trainer. The replay capacity is
 measured in stored observation rows, including episode-reset rows.
 
 Every assisted episode prints a summary immediately on completion, for example
@@ -110,17 +117,41 @@ explicitly instead of inventing targets or reinitializing the policy. As in the
 standalone variant, policy fitting uses full anchor sequences; prefix inputs at
 rollout rely on the learned policy's generalization.
 
-Artifacts are saved beneath the run's log directory:
+Trajectory data stays in memory. Dreamer's replay uses CPU RAM by default and
+is limited to 1 million stored transitions; it is not saved to disk. The
+return-exploration pool keeps compressed completed episodes in RAM until their
+next phase. The classifier and return policy train sequentially inside the
+main Dreamer process. Each source episode is decoded once, replacing its
+compressed record, and the same episode arrays are passed directly to the
+classifier, policy preparation, and anchor-prefix preparation. There are no
+auxiliary training subprocesses, memory-file snapshots, or trajectory archives.
+Once fitting and goal-prefix preparation finish, the source episodes are
+released. Only the goal images, anchor bank, and prefix lookup remain until
+the 100 assisted episodes finish. Those newly generated episodes, together
+with newly completed ordinary episodes, form the next pool. This pool and the
+trainers' working memory are additional to replay RAM and depend on the size
+of the current source set.
 
-- `episode_archive/`: compressed completed episodes and the pending-pool manifest.
-- `return_exploration/round_000001/episodes.pkl`: the exact first snapshot S.
-- Each round also contains classifier and policy checkpoints, their fitting
-  logs, the initial anchor bank and prefix lookup, final counters, rollout
-  results, a summary, and a Dreamer weight/optimizer checkpoint.
+The latest return policy and its optimizer state remain in CPU memory between
+cycles and move to the configured device for fitting. Training restores
+Dreamer's random-generator states and CPU thread count afterward. The normal
+learning rate remains `3e-4` for both initial fitting and later cycles.
 
-Historical source archives stay on disk. Only pending episode IDs and the
-unfinished ordinary episode persist in memory between phases. The standalone
-trainers load each current snapshot into memory during fitting.
+Model checkpoints and small logs are saved beneath the run's log directory:
+
+- `return_exploration/round_000001/` (with the current round number) contains
+  classifier and policy checkpoints, fitting logs, rollout results, and a
+  summary. Only the newest completed round and an in-progress round are kept.
+  The previous round is removed only after the next round succeeds; an external
+  `initial_policy` checkpoint is never removed. Anchor banks, prefix lookups,
+  and counter arrays are not dumped to disk.
+- `latest.pt` contains Dreamer weights and optimizer state, without replay data.
+  It is replaced atomically after each return phase and at training completion.
+- `return_exploration/cycles.jsonl` preserves small summaries of all rounds.
+  Console logs and scalar metrics also retain every assisted episode's return.
+
+These retention rules apply to new runs. Archives and older round directories
+created by earlier versions are not automatically deleted.
 Use a fresh log directory for each run: full online resume of replay and live
 emulator state is not implemented. `initial_policy` warm-starts the return
 policy in a new run; it does not resume Dreamer or its interaction counters.

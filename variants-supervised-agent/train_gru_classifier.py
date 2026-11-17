@@ -350,9 +350,14 @@ def atomic_save(path, payload):
     temporary.replace(path)
 
 
-def parse_args(argv=None):
+def copy_model_state(model):
+    """Keep a best-fit snapshot without retaining live GPU tensors."""
+    return {name: tensor.detach().to('cpu', copy=True) for name, tensor in model.state_dict().items()}
+
+
+def parse_args(argv=None, *, require_archive=True):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--archive", type=Path, required=True)
+    parser.add_argument("--archive", type=Path, required=require_archive)
     parser.add_argument("--output", type=Path, required=True, help="Final recurrent classifier .pt file")
     parser.add_argument("--architecture", choices=("resnet18", "small"), default="resnet18")
     parser.add_argument("--embedding-dim", type=int, default=128)
@@ -378,8 +383,12 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
-def main(argv=None):
-    args = parse_args(argv)
+def train_from_episodes(args, episodes, metadata, source_sha256):
+    """Fit a fresh classifier directly on shared episode arrays.
+
+    This is the online integration entry point. It never reads an archive or
+    reloads its own checkpoints. The caller owns RNG/thread isolation.
+    """
     for name in ("embedding_dim", "hidden_dim", "visual_steps", "gru_steps", "window", "negative_ratio", "threads", "eval_every"):
         if getattr(args, name) < 1:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
@@ -390,7 +399,7 @@ def main(argv=None):
         raise ValueError("--batch-size and --eval-pairs must be positive multiples of negative_ratio + 1")
     visual_path = args.output.with_name(args.output.stem + ".visual.pt")
     report_path = args.output.with_name(args.output.stem + ".metrics.json")
-    if args.archive.resolve() in {path.resolve() for path in (args.output, visual_path, report_path)}:
+    if args.archive is not None and args.archive.resolve() in {path.resolve() for path in (args.output, visual_path, report_path)}:
         raise ValueError("Classifier output files must not replace the input archive")
     if any(path.exists() for path in (args.output, visual_path, report_path)) and not args.overwrite:
         raise FileExistsError("Choose fresh output paths or supply --overwrite")
@@ -400,9 +409,7 @@ def main(argv=None):
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    torch.set_num_threads(args.threads)
     device = ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
-    episodes, metadata = load_archive(args.archive)
     train_ids, test_ids = split_episodes(episodes, metadata, args.test_episodes, args.all_data)
     rng = np.random.default_rng(args.seed)
     if args.all_data:
@@ -421,7 +428,7 @@ def main(argv=None):
     validation_frames = [by_id[index]["frames"] for index in selection_ids]
     config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
     config.update(resolved_device=device, negative_mode="within_episode_random", visual_encoder_frozen_in_gru_stage=True)
-    provenance = dict(archive_sha256=file_sha256(args.archive), training_episode_ids=train_ids,
+    provenance = dict(archive_sha256=source_sha256, training_episode_ids=train_ids,
                       evaluation_episode_ids=test_ids, internal_train_ids=fit_ids, internal_validation_ids=validation_ids,
                       diagnostic_episode_ids=fit_ids if args.all_data else [], selection_scope=selection_scope,
                       train_config=config, threshold=.5)
@@ -439,6 +446,7 @@ def main(argv=None):
         validation_sampler = PairSampler(validation_data, args.window, args.negative_ratio, args.seed + 1)
         pairs = validation_sampler.sample(args.eval_pairs)
         best_key = (-1., -float("inf"))
+        best_checkpoint = None
         for step in range(1, steps + 1):
             model.train()
             first, second, labels = sampler.sample(args.batch_size)
@@ -465,15 +473,20 @@ def main(argv=None):
                 key = (metrics["balanced_accuracy"], -metrics["loss"])
                 if key > best_key:
                     best_key = key
-                    atomic_save(output, dict(kind="standalone_gru_classifier" if recurrent else "standalone_visual_classifier",
+                    checkpoint = dict(kind="standalone_gru_classifier" if recurrent else "standalone_visual_classifier",
                         format_version=1, model_config=model.model_config, model_state=model.state_dict(),
                         model_fingerprint=model_fingerprint(model), optimizer_state=optimizer.state_dict(),
                         sampler_rng_state=sampler.rng.bit_generator.state, step=step, metrics=metrics,
-                        **provenance))
+                        **provenance)
+                    atomic_save(output, checkpoint)
+                    best_checkpoint = {key: value for key, value in checkpoint.items()
+                                       if key not in ('model_state', 'optimizer_state')}
+                    best_checkpoint['model_state'] = copy_model_state(model)
                 report_path.write_text(json.dumps(dict(**provenance, history=history), indent=2) + "\n")
+        return best_checkpoint
 
-    train_stage(visual, fit_frames, validation_frames, args.visual_steps, args.visual_learning_rate, "visual", visual_path)
-    visual_saved = torch.load(visual_path, map_location="cpu", weights_only=True)
+    visual_saved = train_stage(visual, fit_frames, validation_frames, args.visual_steps,
+                               args.visual_learning_rate, "visual", visual_path)
     visual.load_state_dict(visual_saved["model_state"])
     recurrent = RecurrentClassifier(args.architecture, args.embedding_dim, args.hidden_dim).to(device)
     recurrent.encoder.load_state_dict(visual.encoder.state_dict())
@@ -482,10 +495,23 @@ def main(argv=None):
     validation_features = fit_features if args.all_data else cache_features(recurrent, validation_frames, device)
     provenance.update(visual_checkpoint_sha256=file_sha256(visual_path), visual_best_step=visual_saved["step"])
     del visual_saved
-    train_stage(recurrent, fit_features, validation_features, args.gru_steps, args.gru_learning_rate, "gru", args.output)
-    saved, checkpoint = load_classifier(args.output, device="cpu")
-    print(json.dumps(dict(event="saved", classifier=str(args.output), fingerprint=model_fingerprint(saved),
+    checkpoint = train_stage(recurrent, fit_features, validation_features, args.gru_steps,
+                              args.gru_learning_rate, "gru", args.output)
+    recurrent.load_state_dict(checkpoint['model_state'])
+    recurrent.zero_grad(set_to_none=True)
+    recurrent.eval().requires_grad_(False)
+    print(json.dumps(dict(event="saved", classifier=str(args.output), fingerprint=model_fingerprint(recurrent),
                           selected_gru_step=checkpoint["step"], heldout_episodes_used_for_training=0)), flush=True)
+    return recurrent, checkpoint
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    if args.threads < 1:
+        raise ValueError('--threads must be positive')
+    torch.set_num_threads(args.threads)
+    episodes, metadata = load_archive(args.archive)
+    return train_from_episodes(args, episodes, metadata, file_sha256(args.archive))
 
 
 if __name__ == "__main__":

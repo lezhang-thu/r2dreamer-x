@@ -2,7 +2,9 @@
 
 Run with the r2dreamer interpreter after train.py exits successfully. This tool
 does not need a GPU and never loads the large Dreamer checkpoint into memory.
-Only use it on trusted run directories: episode archives contain pickle files.
+Only use it on trusted run directories: legacy episode archives contain pickle
+files. Memory-only runs are checked through retained cycle and episode logs;
+in-process runs also record live optimizer continuation between cycles.
 """
 
 import argparse
@@ -57,7 +59,7 @@ def load_pickle(path):
         return pickle.load(stream)
 
 
-def verify(run_dir, expected_rounds=2):
+def verify(run_dir, expected_rounds=2, allow_short_training=False):
     import torch
 
     root = Path(run_dir).expanduser().resolve()
@@ -77,15 +79,18 @@ def verify(run_dir, expected_rounds=2):
     auxiliary = config['return_exploration']
     require(auxiliary['enabled'] and auxiliary['episodes'] == 100, 'Expected 100 assisted episodes per cycle')
     require(auxiliary['initial_policy'] is None, 'First cycle must train the default new return policy')
-    for name, value in dict(architecture='resnet18', visual_steps=5000, gru_steps=5000,
-                            window=20, batch_size=64).items():
+    for name, value in dict(architecture='resnet18', window=20, batch_size=64).items():
         require(auxiliary['classifier'][name] == value, f'Classifier override is not production: {name}')
-    for name, value in dict(updates=10000, batch_size=4, unroll_length=2048).items():
+    for name, value in dict(batch_size=4, unroll_length=2048).items():
         require(auxiliary['policy'][name] == value, f'Policy override is not production: {name}')
+    for section, name, value in [('classifier', 'visual_steps', 5000),
+                                  ('classifier', 'gru_steps', 5000), ('policy', 'updates', 10000)]:
+        actual = auxiliary[section][name]
+        require(isinstance(actual, int) and actual > 0, f'Invalid training count: {section}.{name}')
+        require(allow_short_training or actual == value,
+                f'{section}.{name} is not production; use --allow-short-training for a smoke run')
     checkpoint_exists(root / 'latest.pt')
     directories = sorted((root / 'return_exploration').glob('round_*'))
-    require(len(directories) == expected_rounds,
-            f'Expected {expected_rounds} completed rounds, found {len(directories)}')
     console = (root / 'console.log').read_text()
     require('Traceback (most recent call last)' not in console, 'Run console contains a traceback')
     require('Compiling update function with torch.compile' in console, 'No compiled-model startup evidence')
@@ -104,6 +109,14 @@ def verify(run_dir, expected_rounds=2):
         require(row.get('train/opt/updates_skipped', 0) == 0,
                 f'Dreamer skipped nonfinite updates at frame step {row["step"]}')
 
+    if (root / 'return_exploration' / 'cycles.jsonl').is_file():
+        return verify_memory_run(root, config, expected_rounds, events, printed, updates,
+                                 console=console, metrics=metrics,
+                                 allow_short_training=allow_short_training)
+
+    require(len(directories) == expected_rounds,
+            f'Expected {expected_rounds} completed rounds, found {len(directories)}')
+    policy_updates = auxiliary['policy']['updates']
     previous_sources, previous_generated, previous_directory = set(), set(), None
     classifier_hashes, round_summaries = [], []
     cumulative_assisted = 0
@@ -143,7 +156,9 @@ def verify(run_dir, expected_rounds=2):
         require(classifier_metrics['evaluation_episode_ids'] == [], f'{label}: classifier reserved a holdout')
         for stage in ('visual', 'gru'):
             history = [row for row in classifier_metrics['history'] if row['stage'] == stage]
-            require(history and history[-1]['step'] == 5000, f'{label}: {stage} training did not reach 5000 updates')
+            target = auxiliary['classifier'][f'{stage}_steps']
+            require(history and history[-1]['step'] == target,
+                    f'{label}: {stage} training did not reach {target} updates')
         require(str(classifier_metrics['train_config']['resolved_device']).startswith('cuda'),
                 f'{label}: classifier was not trained on CUDA')
         checkpoint_exists(directory / 'classifier.pt')
@@ -153,17 +168,17 @@ def verify(run_dir, expected_rounds=2):
         classifier_hashes.append(classifier_hash)
 
         policy_log = read_jsonl(directory / 'agent' / 'training.jsonl')
-        require([row['update'] for row in policy_log] == list(range(1, 10001)),
-                f'{label}: policy did not complete exactly 10000 additional updates')
+        require([row['update'] for row in policy_log] == list(range(1, policy_updates + 1)),
+                f'{label}: policy did not complete exactly {policy_updates} additional updates')
         require(all(math.isfinite(row['loss']) and math.isfinite(row['gradient_norm']) for row in policy_log),
                 f'{label}: nonfinite policy training metric')
         policy_report = read_json(directory / 'agent' / 'training_report.json')
-        require(policy_report['update'] == 10000, f'{label}: incomplete policy report')
+        require(policy_report['update'] == policy_updates, f'{label}: incomplete policy report')
         for name in ('best.pt', 'latest.pt'):
             checkpoint_exists(directory / 'agent' / name)
         policy = torch.load(directory / 'agent' / 'latest.pt', map_location='cpu', weights_only=True)
         metadata = policy['metadata']
-        require(policy['update'] == 10000, f'{label}: latest policy checkpoint is incomplete')
+        require(policy['update'] == policy_updates, f'{label}: latest policy checkpoint is incomplete')
         require(policy.get('cuda_rng_state') is not None, f'{label}: policy checkpoint lacks CUDA training RNG state')
         require(metadata['classifier_sha256'] == classifier_hash, f'{label}: policy uses another classifier')
         require(metadata['archive_sha256'] == sha256(directory / 'episodes.pkl'), f'{label}: policy uses another archive')
@@ -176,10 +191,10 @@ def verify(run_dir, expected_rounds=2):
                     f'{label}: fine-tuning did not use the preceding latest policy')
             require(metadata['finetuned_from_sha256'] == sha256(previous_policy),
                     f'{label}: fine-tuning input checkpoint hash differs')
-            require(metadata['previous_training_updates'] == (number - 1) * 10000,
+            require(metadata['previous_training_updates'] == (number - 1) * policy_updates,
                     f'{label}: cumulative previous policy updates were reset')
         optimizer_steps = [int(value['step']) for value in policy['optimizer_state']['state'].values() if 'step' in value]
-        require(optimizer_steps and max(optimizer_steps) == number * 10000,
+        require(optimizer_steps and max(optimizer_steps) == number * policy_updates,
                 f'{label}: optimizer step history was not retained across cycles')
         del policy
         checkpoint_exists(directory / 'dreamer.pt')
@@ -237,13 +252,241 @@ def verify(run_dir, expected_rounds=2):
                 last_logged_dreamer_updates=updates[-1]['train/opt/updates'], rounds=round_summaries)
 
 
+def verify_memory_run(root, config, expected_rounds, events, printed, updates, *,
+                      console, metrics, allow_short_training=False):
+    import torch
+
+    auxiliary = config['return_exploration']
+    exploration = root / 'return_exploration'
+    reports = read_jsonl(exploration / 'cycles.jsonl')
+    require(len(reports) == expected_rounds,
+            f'Expected {expected_rounds} completed cycle summaries, found {len(reports)}')
+    execution = reports[0].get('training_execution')
+    require(execution in (None, 'in_process'), f'Unexpected auxiliary training execution: {execution}')
+    directory = exploration / f'round_{expected_rounds:06d}'
+    require(sorted(exploration.glob('round_*')) == [directory] and directory.is_dir(),
+            'Completed run must retain exactly the latest round directory')
+    plan = read_json(directory / 'plan.json')
+    prefix_selection = plan.get('prefix_sampling', 'legacy')
+    shortest_prefixes = prefix_selection == 'shortest_matching_anchor_prefix'
+    if shortest_prefixes:
+        require(plan.get('prefix_tiebreak') == 'lowest_episode_id',
+                'Shortest-prefix selection has an unexpected tie-break rule')
+    evaluation_disabled = None
+    if execution == 'in_process':
+        require(config['env']['eval_episode_num'] == 0,
+                'In-process run did not disable evaluation environment configuration')
+        require('Evaluating the policy' not in console,
+                'In-process run launched Dreamer evaluation')
+        require(not any(key.startswith('episode/eval_') for row in metrics for key in row),
+                'In-process run logged Dreamer evaluation metrics')
+        evaluation_disabled = True
+    require(not (root / 'episode_archive').exists(), 'A persistent episode archive remains')
+    trajectory_files = sorted(path.relative_to(root).as_posix() for path in root.rglob('*')
+                              if path.is_file() and path.suffix in ('.pkl', '.npz'))
+    require(not trajectory_files, f'Trajectory files remain on disk: {trajectory_files}')
+    forbidden = {'anchors.initial.json', 'counts.json', 'dreamer.pt', 'classifier.visual.pt'}
+    require(not any(path.name in forbidden for path in exploration.rglob('*')),
+            'Historical anchor dumps or redundant checkpoints remain')
+    expected_models = {root / 'latest.pt', directory / 'classifier.pt',
+                       directory / 'agent' / 'best.pt', directory / 'agent' / 'latest.pt'}
+    require(set(root.rglob('*.pt')) == expected_models,
+            'Model checkpoint retention differs from one Dreamer and one completed auxiliary round')
+    require(not list(root.rglob('*.pt.tmp')), 'An unfinished checkpoint replacement remains')
+    for path in expected_models:
+        checkpoint_exists(path)
+
+    consumed_sources, previous_generated = set(), set()
+    classifier_hashes, round_summaries = set(), []
+    cumulative_assisted = 0
+    latest_events = []
+    for number, report in enumerate(reports, 1):
+        label = f'Round {number}'
+        require(report['trajectory_storage'] == 'memory', f'{label}: source trajectories were not memory-only')
+        require(report.get('training_execution') == execution,
+                f'{label}: auxiliary training execution changed between cycles')
+        source_ids = set(report['source_episode_ids'])
+        generated = set(report['generated_episode_ids'])
+        require(len(source_ids) == len(report['source_episode_ids']) == report['source_episodes'] > 0,
+                f'{label}: empty or duplicate source IDs')
+        require(not source_ids & consumed_sources, f'{label}: older source episodes were reused')
+        if number > 1:
+            require(previous_generated <= source_ids,
+                    f'{label}: S does not contain all previous 100 assisted episodes')
+            require(source_ids - previous_generated, f'{label}: no newly completed ordinary source episodes')
+        require(len(generated) == len(report['generated_episode_ids']) == report['generated_episodes'] == 100,
+                f'{label}: not all 100 assisted episodes completed')
+        require(not generated & (consumed_sources | source_ids), f'{label}: generated IDs were reused')
+        require(len(report['pending_episode_ids']) == 100 and set(report['pending_episode_ids']) == generated,
+                f'{label}: consumed source records remain in the pending pool')
+        for key in ('source_sha256', 'classifier_sha256', 'policy_sha256'):
+            require(re.fullmatch(r'[0-9a-f]{64}', report[key]), f'{label}: invalid {key}')
+        require(report['classifier_sha256'] not in classifier_hashes,
+                f'{label}: classifier checkpoint reused from a prior cycle')
+        classifier_hashes.add(report['classifier_sha256'])
+        require(Path(report['policy_checkpoint']).resolve() ==
+                exploration / f'round_{number:06d}' / 'agent' / 'latest.pt',
+                f'{label}: unexpected saved policy path')
+
+        round_events = [event for event in events if event['round'] == number]
+        require([event['episode'] for event in round_events] == list(range(1, 101)),
+                f'{label}: printed episodes are incomplete')
+        require([event['episode_id'] for event in round_events] == report['generated_episode_ids'],
+                f'{label}: generated IDs differ between cycle and console records')
+        round_printed = [(int(index), int(total), float(value)) for rnd, index, total, value in printed
+                         if int(rnd) == number]
+        require([(index, total) for index, total, _ in round_printed] ==
+                [(index, 100) for index in range(1, 101)],
+                f'{label}: human-readable episode counters are incomplete')
+        selected_prefixes = {}
+        for event, (_, _, printed_return) in zip(round_events, round_printed):
+            require(math.isfinite(event['env_return']), f'{label}: nonfinite episode return')
+            require(math.isclose(printed_return, event['env_return'], abs_tol=.0051),
+                    f'{label}: human-readable return differs from console JSON')
+            require('anchor_indices' not in event, f'{label}: generated anchor sequences were dumped')
+            require(event['interactions'] > 0, f'{label}: empty generated episode')
+            require(event['source_episode_id'] in source_ids, f'{label}: goal prefix is outside S')
+            require(isinstance(event['prefix_anchor_position'], int) and event['prefix_anchor_position'] >= 0,
+                    f'{label}: invalid inclusive prefix position')
+            require(0 <= event['representative'] < report['representatives'],
+                    f'{label}: selected representative is outside the frozen bank')
+            if shortest_prefixes:
+                prefix = (event['source_episode_id'], event['prefix_anchor_position'])
+                previous_prefix = selected_prefixes.setdefault(event['representative'], prefix)
+                require(prefix == previous_prefix,
+                        f'{label}: a representative changed its precomputed shortest prefix')
+                # Source arrays are deliberately released. Unit tests establish
+                # minimality; retained logs can verify deterministic selection.
+            require(event['target_count_before'] >= 1 and event['counter_increments'] >= 0,
+                    f'{label}: invalid anchor counter update')
+        require(report['initial_counter_total'] >= report['representatives'] > 0,
+                f'{label}: initial anchor counters are invalid')
+        require(report['final_counter_total'] == report['initial_counter_total'] +
+                sum(event['counter_increments'] for event in round_events),
+                f'{label}: anchor counter totals differ from rollout increments')
+        require(report['reached'] == sum(event['reached'] for event in round_events) and
+                report['takeovers'] == sum(event['takeover'] for event in round_events),
+                f'{label}: handoff summaries differ from episode records')
+        cumulative_assisted += sum(event['interactions'] for event in round_events)
+        ordinary = number * auxiliary['interval']
+        require(report['ordinary_interactions'] == ordinary,
+                f'{label}: assisted interactions advanced the ordinary clock')
+        require(report['assisted_interactions'] == cumulative_assisted and
+                report['total_interactions'] == ordinary + cumulative_assisted,
+                f'{label}: assisted or total interaction count differs')
+        require(report['next_milestone'] == ordinary + auxiliary['interval'],
+                f'{label}: next ordinary collection milestone is incorrect')
+        boundary = ordinary * config['env']['action_repeat']
+        before = [row for row in updates if row['step'] <= boundary]
+        after = [row for row in updates if row['step'] > boundary]
+        require(before and after and after[0]['train/opt/updates'] > before[-1]['train/opt/updates'],
+                f'{label}: no logged Dreamer optimizer progress after the return phase')
+        round_summaries.append(dict(round=number, source_episodes=len(source_ids), generated_episodes=100,
+                                   reached=report['reached'], takeovers=report['takeovers'],
+                                   episode_interactions_min=min(event['interactions'] for event in round_events),
+                                   episode_interactions_max=max(event['interactions'] for event in round_events),
+                                   return_min=min(event['env_return'] for event in round_events),
+                                   return_max=max(event['env_return'] for event in round_events),
+                                   return_mean=sum(event['env_return'] for event in round_events) / 100,
+                                   ordinary_interactions=ordinary, assisted_interactions=cumulative_assisted,
+                                   classifier_sha256=report['classifier_sha256']))
+        consumed_sources.update(source_ids)
+        previous_generated, latest_events = generated, round_events
+
+    report = reports[-1]
+    require(read_json(directory / 'report.json') == report, 'Latest cycle report differs from history')
+    require(plan['trajectory_storage'] == 'memory' and plan['source_sha256'] == report['source_sha256'],
+            'Latest plan differs from the in-memory source summary')
+    require(plan.get('training_execution') == execution,
+            'Latest plan and cycle report disagree on auxiliary training execution')
+    require(plan['source_ids'] == report['source_episode_ids'] and plan['episodes'] == 100,
+            'Latest plan differs from the source pool or requested generation count')
+    previous_policy = exploration / f'round_{expected_rounds - 1:06d}' / 'agent' / 'latest.pt'
+    require(Path(plan['previous_policy']).resolve() == previous_policy,
+            'Latest plan did not fine-tune the preceding round policy')
+    rollouts = read_json(directory / 'rollouts.json')
+    require(rollouts == [{key: value for key, value in event.items()
+                          if key not in ('event', 'round', 'episode')} for event in latest_events],
+            'Latest rollout records differ from per-episode console JSON')
+
+    classifier_metrics = read_json(directory / 'classifier.metrics.json')
+    source_ids = set(report['source_episode_ids'])
+    require(set(classifier_metrics['training_episode_ids']) == source_ids,
+            'Latest classifier omitted source episodes')
+    require(classifier_metrics['evaluation_episode_ids'] == [], 'Latest classifier reserved a holdout')
+    require(classifier_metrics['archive_sha256'] == report['source_sha256'],
+            'Latest classifier used another source set')
+    for stage in ('visual', 'gru'):
+        history = [row for row in classifier_metrics['history'] if row['stage'] == stage]
+        target = auxiliary['classifier'][f'{stage}_steps']
+        require(history and history[-1]['step'] == target,
+                f'Latest classifier {stage} training did not reach {target} updates')
+    require(str(classifier_metrics['train_config']['resolved_device']).startswith('cuda'),
+            'Latest classifier was not trained on CUDA')
+    require(sha256(directory / 'classifier.pt') == report['classifier_sha256'],
+            'Latest classifier hash differs from the cycle summary')
+    policy_updates = auxiliary['policy']['updates']
+    policy_log = read_jsonl(directory / 'agent' / 'training.jsonl')
+    require([row['update'] for row in policy_log] == list(range(1, policy_updates + 1)),
+            f'Latest policy did not complete exactly {policy_updates} additional updates')
+    require(all(math.isfinite(row['loss']) and math.isfinite(row['gradient_norm']) for row in policy_log),
+            'Latest policy training has nonfinite metrics')
+    require(read_json(directory / 'agent' / 'training_report.json')['update'] == policy_updates,
+            'Latest policy report is incomplete')
+    policy_path = directory / 'agent' / 'latest.pt'
+    require(sha256(policy_path) == report['policy_sha256'], 'Latest policy hash differs from the cycle summary')
+    policy = torch.load(policy_path, map_location='cpu', weights_only=True)
+    metadata = policy['metadata']
+    if execution == 'in_process':
+        require(metadata.get('optimizer_continuation') == 'memory',
+                'Latest return policy did not retain its live optimizer across cycles')
+    require(policy['update'] == policy_updates, 'Latest policy checkpoint is incomplete')
+    require(policy.get('cuda_rng_state') is not None, 'Latest policy checkpoint lacks CUDA training RNG state')
+    require(metadata['classifier_sha256'] == report['classifier_sha256'] and
+            metadata['archive_sha256'] == report['source_sha256'],
+            'Latest policy classifier or archive provenance differs')
+    require(set(metadata['training_episode_ids']) == source_ids, 'Latest policy source IDs differ')
+    require(Path(metadata['finetuned_from']).resolve() == previous_policy,
+            'Latest policy did not fine-tune the preceding policy checkpoint')
+    require(metadata['finetuned_from_sha256'] == reports[-2]['policy_sha256'],
+            'Fine-tuning input hash differs from the previous retained cycle summary')
+    require(metadata['previous_training_updates'] == (expected_rounds - 1) * policy_updates,
+            'Cumulative previous policy updates were reset')
+    optimizer_steps = [int(value['step']) for value in policy['optimizer_state']['state'].values() if 'step' in value]
+    require(optimizer_steps and max(optimizer_steps) == expected_rounds * policy_updates,
+            'Policy optimizer step history was not retained across cycles')
+    if execution == 'in_process':
+        populated_states = [value for value in policy['optimizer_state']['state'].values() if value]
+        require(populated_states and all('step' in value and int(value['step']) == expected_rounds * policy_updates
+                                         for value in populated_states),
+                'Some live optimizer states did not retain the full cumulative update count')
+    del policy
+    round_summaries[-1]['policy_optimizer_steps'] = max(optimizer_steps)
+    ordinary_budget = config['env']['steps'] // config['env']['action_repeat']
+    require(sum(row['takeovers'] for row in round_summaries) > 0,
+            'No live return-to-Dreamer handoff was exercised')
+    require(ordinary_budget > expected_rounds * auxiliary['interval'],
+            'Run ended at the last cycle without resumed collection')
+    return dict(status='passed', run_dir=str(root), device=config['device'], task=config['env']['task'],
+                model='size100M', compile=True, cycle_interval=auxiliary['interval'],
+                trajectory_storage='memory', training_profile='smoke' if allow_short_training else 'production',
+                training_execution=execution or 'legacy',
+                evaluation_disabled=evaluation_disabled, prefix_selection=prefix_selection,
+                retained_round_directories=1, episode_time_limit_frames=config['env']['time_limit'],
+                ordinary_interaction_budget=ordinary_budget, assisted_interactions=cumulative_assisted,
+                completed_rounds=expected_rounds, completed_assisted_episodes=100 * expected_rounds,
+                last_logged_dreamer_updates=updates[-1]['train/opt/updates'], rounds=round_summaries)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('run_dir', type=Path)
     parser.add_argument('--expected-rounds', type=int, default=2)
+    parser.add_argument('--allow-short-training', action='store_true',
+                        help='Accept positive configured auxiliary update counts instead of production counts')
     args = parser.parse_args()
     try:
-        result = verify(args.run_dir, args.expected_rounds)
+        result = verify(args.run_dir, args.expected_rounds, args.allow_short_training)
     except (AssertionError, KeyError, ValueError, OSError) as error:
         parser.exit(1, f'GPU integration verification failed: {error}\n')
     print(json.dumps(result, indent=2, allow_nan=False))

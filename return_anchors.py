@@ -131,7 +131,7 @@ class AnchorBank:
         return weights / weights.sum()
 
     def sample(self, rng):
-        """Return (representative index, (episode ID, inclusive anchor position))."""
+        """Sample a target by count, then uniformly choose a matching source prefix."""
         index = int(rng.choice(len(self), p=self.probabilities()))
         members = self.prefixes[index]
         return index, members[int(rng.integers(len(members)))]

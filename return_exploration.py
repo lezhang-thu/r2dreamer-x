@@ -7,11 +7,15 @@ before updating the frozen anchor bank's counters and sampling the next goal.
 """
 
 import gc
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+import hashlib
 import json
 from pathlib import Path
+import random
 import secrets
-import subprocess
+import shutil
 import sys
+import traceback
 
 import numpy as np
 from omegaconf import OmegaConf
@@ -38,6 +42,31 @@ def save_json(path, payload):
     temporary = path.with_suffix(path.suffix + '.tmp')
     temporary.write_text(json.dumps(payload, indent=2, allow_nan=False) + '\n')
     temporary.replace(path)
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+@contextmanager
+def auxiliary_training_context(device):
+    """Keep auxiliary seeds and CPU thread settings out of Dreamer's stream."""
+    python_state, numpy_state = random.getstate(), np.random.get_state()
+    threads = torch.get_num_threads()
+    device = torch.device(device)
+    cuda_devices = ([device.index if device.index is not None else torch.cuda.current_device()]
+                    if device.type == 'cuda' else [])
+    try:
+        with torch.random.fork_rng(devices=cuda_devices):
+            yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        torch.set_num_threads(threads)
 
 
 def observation_batch(observation, reward, device):
@@ -131,9 +160,8 @@ class ReturnExploration:
         if self.interval < 1 or self.episodes < 1:
             raise ValueError('Return interval and episode count must be positive')
         self.root = Path(logdir).resolve() / 'return_exploration'
-        archive_dir = Path(logdir).resolve() / 'episode_archive'
         if ((self.root.exists() and any(self.root.iterdir()))
-                or (archive_dir / 'manifest.json').exists()):
+                or (Path(logdir) / 'episode_archive' / 'manifest.json').exists()):
             raise ValueError('Use a fresh logdir; online replay/environment resume is not implemented. '
                              'Use return_exploration.initial_policy to warm-start a compatible return policy.')
         self.root.mkdir(parents=True, exist_ok=True)
@@ -141,7 +169,9 @@ class ReturnExploration:
                         env_config=OmegaConf.to_container(env_config, resolve=True))
         if action_meanings is not None:
             metadata['action_meanings'] = list(action_meanings)
-        self.archive = EpisodeArchive(archive_dir, metadata)
+        self.archive = EpisodeArchive(metadata)
+        self.policy_state = None
+        self._previous_directory = None
         self.recorder = None
         self.next_milestone = self.interval
         self.round = 0
@@ -173,57 +203,67 @@ class ReturnExploration:
     def due(self, ordinary_interactions):
         return ordinary_interactions >= self.next_milestone
 
-    def _train(self, module, arguments, logfile):
-        command = [sys.executable, '-u', str(VARIANT / module), *map(str, arguments)]
-        print(f'Return phase: {module}; progress in {logfile}', flush=True)
-        # Separate processes isolate auxiliary optimizer RNG/thread settings
-        # from Dreamer and release their optimizer allocations after fitting.
-        with logfile.open('w') as stream:
-            result = subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT, check=False)
-        if result.returncode:
-            raise RuntimeError(f'{module} failed (exit {result.returncode}); see {logfile}')
+    def _train(self, name, function, arguments, logfile, **inputs):
+        print(f'Return phase (in process): {name}; progress in {logfile}', flush=True)
+        torch.set_num_threads(arguments.threads)
+        with logfile.open('w') as stream, redirect_stdout(stream), redirect_stderr(stream):
+            try:
+                return function(arguments, **inputs)
+            except Exception as error:
+                traceback.print_exc()
+                raise RuntimeError(f'{name} failed; see {logfile}') from error
 
-    def run(self, agent, replay, ordinary_interactions):
-        if not self.due(ordinary_interactions):
-            raise ValueError('Return phase called before its ordinary-collection milestone')
-        if not self.archive.pending_ids:
-            # With the default episode time limit this cannot occur at 100k.
-            # Keep the milestone pending until the first complete source exists.
-            return False
-        self.round += 1
-        directory = self.root / f'round_{self.round:06d}'
-        directory.mkdir()
-        archive_path = directory / 'episodes.pkl'
-        source_ids = self.archive.snapshot(archive_path)
+    def _prepare_round(self, directory, ordinary_interactions):
+        source_ids = self.archive.pending_ids
+        source_hash = self.archive.fingerprint(source_ids)
+        # Decode once, replacing compressed records in place. Every stage below
+        # reads the same arrays; there is no serialized snapshot or IPC copy.
+        episodes = self.archive.materialize(source_ids)
+        with auxiliary_training_context(self.device):
+            return self._fit_episodes(directory, ordinary_interactions, episodes,
+                                      source_ids, source_hash)
+
+    def _fit_episodes(self, directory, ordinary_interactions, episodes, source_ids, source_hash):
+        classifier_module, supervised = variant_modules()
         save_json(directory / 'plan.json', dict(source_ids=source_ids, episodes=self.episodes,
+                  trajectory_storage='memory', training_execution='in_process', source_sha256=source_hash,
                   ordinary_interactions=ordinary_interactions, milestone=self.next_milestone,
                   counter_sampling='inverse_count', prefix_sampling='uniform_matching_occurrence',
                   previous_policy=str(self.policy_checkpoint) if self.policy_checkpoint else None))
         classifier_path = directory / 'classifier.pt'
-        classifier_args = ['--archive', archive_path, '--output', classifier_path,
-                           '--device', self.device, '--all-data']
+        classifier_args = ['--output', str(classifier_path), '--device', self.device, '--all-data']
         for key, value in self.config.classifier.items():
-            classifier_args.extend(['--' + key.replace('_', '-'), value])
-        self._train('train_gru_classifier.py', classifier_args, directory / 'classifier.log')
-        policy_output = directory / 'agent'
-        policy_args = ['train', '--archive', archive_path, '--classifier', classifier_path,
-                       '--output', policy_output, '--device', self.device, '--skip-empty-anchors']
-        for key, value in self.config.policy.items():
-            policy_args.extend(['--' + key.replace('_', '-'), value])
-        if self.policy_checkpoint is not None:
-            policy_args.extend(['--finetune', self.policy_checkpoint])
-        self._train('train_supervised_agent.py', policy_args, directory / 'policy.log')
+            classifier_args.extend(['--' + key.replace('_', '-'), str(value)])
+        classifier_args = classifier_module.parse_args(classifier_args, require_archive=False)
+        classifier, checkpoint = self._train(
+            'classifier', classifier_module.train_from_episodes, classifier_args,
+            directory / 'classifier.log', episodes=episodes, metadata=self.archive.metadata,
+            source_sha256=source_hash)
 
-        classifier_module, supervised = variant_modules()
-        classifier, checkpoint = classifier_module.load_classifier(classifier_path, self.device)
-        episodes, _ = classifier_module.load_archive(archive_path)
-        demos = supervised.prepare_demonstrations(episodes, checkpoint['training_episode_ids'],
-                    classifier, checkpoint['threshold'], self.device, skip_empty=True)
-        saved = torch.load(policy_output / 'best.pt', map_location='cpu', weights_only=True)
-        policy = supervised.GoalPolicy(**saved['model_config']).to(self.device)
-        policy.load_state_dict(saved['model_state'])
-        policy.eval().requires_grad_(False)
-        del saved
+        # Extract once: policy fitting and the anchor bank share these demos.
+        demos = supervised.prepare_demonstrations(
+            episodes, checkpoint['training_episode_ids'], classifier, checkpoint['threshold'],
+            self.device, skip_empty=True)
+        policy_output = directory / 'agent'
+        policy_args = ['train', '--output', str(policy_output), '--device', self.device,
+                       '--skip-empty-anchors']
+        for key, value in self.config.policy.items():
+            policy_args.extend(['--' + key.replace('_', '-'), str(value)])
+        if self.policy_state is None and self.policy_checkpoint is not None:
+            policy_args.extend(['--finetune', str(self.policy_checkpoint)])
+        policy_args = supervised.parse_args(policy_args, require_inputs=False)
+        try:
+            self.policy_state, policy = self._train(
+                'return policy', supervised.train_from_demonstrations, policy_args,
+                directory / 'policy.log', classifier=classifier, classifier_ckpt=checkpoint,
+                metadata=self.archive.metadata, demos=demos,
+                classifier_sha256=file_sha256(classifier_path), state=self.policy_state)
+        finally:
+            # Keep latest weights and Adam history for the next round, without
+            # occupying GPU memory during Dreamer training or assisted rollouts.
+            if self.policy_state is not None:
+                self.policy_state.optimizer.zero_grad(set_to_none=True)
+                self.policy_state.to('cpu')
 
         @torch.no_grad()
         def similarity(left, right):
@@ -234,10 +274,27 @@ class ReturnExploration:
             return classifier.pair_logits(a, b).sigmoid().reshape(len(left), len(right)).cpu().numpy()
 
         bank = AnchorBank.build(demos, similarity, checkpoint['threshold'])
-        save_json(directory / 'anchors.initial.json', bank.state_dict())
         # Only goal images and lookup indices are needed for the 100 rollouts.
         goals_by_id = {demo['id']: demo['goals'] for demo in demos}
-        del episodes, demos
+        return classifier, policy, bank, goals_by_id, source_ids, source_hash
+
+    def run(self, agent, replay, ordinary_interactions):
+        if not self.due(ordinary_interactions):
+            raise ValueError('Return phase called before its ordinary-collection milestone')
+        if not self.archive.pending_ids:
+            return False
+        self.round += 1
+        directory = self.root / f'round_{self.round:06d}'
+        directory.mkdir()
+        classifier, policy, bank, goals_by_id, source_ids, source_hash = self._prepare_round(
+            directory, ordinary_interactions)
+        # All fitting and prefix preparation used shared episode arrays. Drop
+        # raw S now; goal images and prefix indices are enough for returning.
+        self.archive.consume(source_ids)
+        initial_counter_total = int(bank.counts.sum())
+        # Visual-stage weights are no longer used after the recurrent fit.
+        (directory / 'classifier.visual.pt').unlink(missing_ok=True)
+        policy_output = directory / 'agent'
         from envs import make_env
         config = OmegaConf.create(OmegaConf.to_container(self.env_config, resolve=True))
         config.seed = secrets.randbelow(2**31 - 1)
@@ -264,36 +321,51 @@ class ReturnExploration:
                                                           return_round=self.round))
                 del episode, rows
                 increments = bank.update(references)
+                # Keep scalar diagnostics, not generated anchor sequences, on disk.
+                result.pop('anchor_indices', None)
                 result.update(episode_id=new_id, representative=representative,
                               source_episode_id=episode_id, prefix_anchor_position=position,
                               target_count_before=count_before, counter_increments=int(increments.sum()))
                 records.append(result)
                 save_json(directory / 'rollouts.json', records)
-                save_json(directory / 'counts.json', dict(counts=bank.counts.tolist(),
-                          completed_episodes=len(records), assisted_interactions=self.assisted_interactions))
                 print(json.dumps(dict(event='return_episode', round=self.round,
                                       episode=index + 1, **result)), flush=True)
         finally:
             env.close()
             agent.train(was_training)
         self.policy_checkpoint = policy_output / 'latest.pt'
-        self.archive.consume(source_ids)
         self.next_milestone = (ordinary_interactions // self.interval + 1) * self.interval
-        save_json(directory / 'report.json', dict(ordinary_interactions=ordinary_interactions,
+        report = dict(ordinary_interactions=ordinary_interactions,
                   assisted_interactions=self.assisted_interactions,
                   total_interactions=ordinary_interactions + self.assisted_interactions,
                   generated_episodes=len(records), source_episodes=len(source_ids),
+                  trajectory_storage='memory', training_execution='in_process',
+                  source_episode_ids=list(source_ids),
+                  generated_episode_ids=[row['episode_id'] for row in records],
+                  source_sha256=source_hash, pending_episode_ids=list(self.archive.pending_ids),
+                  initial_counter_total=initial_counter_total, final_counter_total=int(bank.counts.sum()),
                   representatives=len(bank), reached=sum(row['reached'] for row in records),
                   takeovers=sum(row['takeover'] for row in records), next_milestone=self.next_milestone,
-                  environment_seed=int(config.seed), policy_checkpoint=str(self.policy_checkpoint)))
-        # Persist Dreamer too; this is a weight checkpoint, not an online resume.
+                  environment_seed=int(config.seed), policy_checkpoint=str(self.policy_checkpoint),
+                  policy_sha256=file_sha256(self.policy_checkpoint),
+                  classifier_sha256=file_sha256(directory / 'classifier.pt'))
+        save_json(directory / 'report.json', report)
+        # One rolling weight/optimizer checkpoint; replay is never serialized.
         import tools
-        temporary = directory / 'dreamer.pt.tmp'
+        temporary = self.root.parent / 'latest.pt.tmp'
         torch.save(dict(agent_state_dict=agent.state_dict(),
                         optims_state_dict=tools.recursively_collect_optim_state_dict(agent),
                         ordinary_interactions=ordinary_interactions,
                         assisted_interactions=self.assisted_interactions), temporary)
-        temporary.replace(directory / 'dreamer.pt')
+        temporary.replace(self.root.parent / 'latest.pt')
+        with (self.root / 'cycles.jsonl').open('a') as stream:
+            stream.write(json.dumps(report, allow_nan=False) + '\n')
+        # Keep the preceding successful round until this one is fully saved.
+        # Only directories created by this instance are eligible for removal;
+        # an external initial_policy checkpoint is never touched.
+        if self._previous_directory is not None:
+            shutil.rmtree(self._previous_directory)
+        self._previous_directory = directory
         del policy, classifier, bank, goals_by_id
         gc.collect()
         if torch.cuda.is_available():

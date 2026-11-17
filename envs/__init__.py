@@ -2,15 +2,14 @@ from . import parallel, wrappers
 
 
 def make_envs(config):
+    """Construct training workers only; periodic evaluation is disabled."""
     def env_constructor(idx):
         return lambda: make_env(config, idx)
 
     train_envs = parallel.ParallelEnv(env_constructor, config.env_num, config.device)
-    eval_envs = (
-        parallel.ParallelEnv(env_constructor, config.eval_episode_num, config.device)
-        if config.eval_episode_num > 0
-        else None
-    )
+    # Preserve the caller's return signature without allocating idle evaluation
+    # workers, including for older configs with a positive eval_episode_num.
+    eval_envs = None
     obs_space = train_envs.observation_space
     act_space = train_envs.action_space
     return train_envs, eval_envs, obs_space, act_space

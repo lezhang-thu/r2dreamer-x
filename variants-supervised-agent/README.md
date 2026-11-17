@@ -13,24 +13,27 @@ not require R2-Dreamer, its world model, A2C, SAC, or the augmentation experimen
 
 ## Input: an existing trajectory pickle
 
-With periodic return exploration enabled in the main R2-Dreamer trainer, each
-cycle writes a compatible snapshot of its completed source trajectories at:
+The standalone commands below accept an existing trajectory pickle through
+`--archive`. They do not require the main R2-Dreamer trainer to create one.
 
-```text
-<logdir>/return_exploration/round_000001/episodes.pkl
-```
-
-Use the snapshot path for `--archive` in both commands below. It contains that
-cycle's set S, with aligned executed actions, the action count, and environment
-preprocessing configuration; no `--num-actions` or `--env-config` override is
-needed. Evaluation rollouts and unfinished episodes are excluded. The first
-cycle uses ordinary training episodes completed so far. Subsequent cycles use
-the previous cycle's 100 assisted episodes plus ordinary episodes completed
-since the previous snapshot. Older source episodes are excluded.
+With periodic return exploration enabled, the main trainer keeps completed
+source trajectories compressed in RAM. It calls the classifier and policy
+training functions directly in the same process. Each episode in the cycle's
+set S is decoded once, replacing its compressed record; the same arrays are
+shared by classifier fitting, policy preparation, and anchor-prefix setup.
+No training subprocess, memory-file snapshot, or trajectory pickle is needed.
+The in-memory data includes aligned executed actions, the action count, and
+environment preprocessing configuration, so no `--num-actions` or
+`--env-config` override is needed. The integrated path provides no archive
+path for later standalone use.
+Unfinished episodes are excluded. The first cycle uses
+ordinary training episodes completed so far. Subsequent cycles use the previous
+cycle's 100 assisted episodes plus ordinary episodes completed since the
+previous source selection. Older source episodes are excluded.
 
 The standalone default train/validation/holdout split needs at least three
 completed episodes. The integrated cycle uses `--all-data`, described below,
-and can fit a nonempty snapshot without reserving episodes. See the repository
+and can fit a nonempty source set without reserving episodes. See the repository
 README for the MontezumaRevenge launcher and return-exploration configuration.
 
 The existing H.E.R.O. archive works directly:
@@ -188,8 +191,8 @@ environment interactions. Its 50-million-interaction budget counts only that
 ordinary collection; assisted episodes and their Dreamer takeovers are logged
 separately. Each cycle generates exactly 100 assisted episodes.
 
-For each source snapshot S, the integrated path trains a fresh classifier with
-`--all-data`. This overrides any declared episode split: every episode is used
+For each source set S, the integrated path trains a fresh classifier with the
+equivalent of `--all-data`. This overrides any declared episode split: every episode is used
 for fitting, and there is no evaluation holdout or internal validation-episode
 split. Checkpoint selection uses independently sampled diagnostic pairs from
 those same training episodes. Metrics label this scope as
@@ -197,34 +200,63 @@ those same training episodes. Metrics label this scope as
 estimates of generalization. All other classifier defaults stay the same:
 ResNet-18, 5,000 visual updates, 5,000 GRU updates, and temporal window 20.
 
-The supervised trainer uses all classifier training IDs. Pass
-`--finetune PREVIOUS_OUTPUT/latest.pt` to carry the previous return-policy
-parameters **and Adam optimizer state** into a fresh output directory with the
-new archive and classifier. It resets the per-dataset sampling schedule and
-checkpoint-selection score. `--updates 10000` then performs **10,000 additional
-updates** for this cycle. This differs from `--resume`, which continues the same
-dataset and classifier toward a total update target in the same output folder.
-The two options are mutually exclusive. Fine-tuning requires a compatible
-policy architecture and action mapping; it rejects a known change of game.
+The supervised trainer uses all classifier training IDs. The integrated path
+continues with the same return-policy parameters **and AdamW optimizer state
+in memory**. It keeps them on CPU between cycles and moves them to the configured
+device for fitting. A new source set resets only the per-dataset sampling
+schedule and checkpoint-selection score. Each cycle performs **10,000 additional
+updates** by default, with the same `3e-4` learning rate. The best training-fit
+weights are copied for returning; the latest weights and optimizer remain the
+next cycle's starting point. Auxiliary fitting restores Dreamer's random-generator
+states and CPU thread count afterward.
 
-For example, from this directory, with paths replaced by actual cycle outputs:
+For standalone commands, pass `--finetune PREVIOUS_OUTPUT/latest.pt` to load
+the previous parameters and optimizer state into a fresh output directory.
+This differs from `--resume`, which continues the same dataset and classifier
+toward a total update target in the same output folder. The two options are
+mutually exclusive. Fine-tuning requires a compatible policy architecture and
+action mapping; it rejects a known change of game.
+
+For example, to fine-tune manually using a separately supplied archive, replace
+the paths below with your archive and model locations. The integrated trainer
+passes episode arrays directly and does not use these archive-loading commands:
 
 ```bash
 python train_gru_classifier.py \
-  --archive /path/to/new_round/episodes.pkl \
+  --archive /path/to/source/episodes.pkl \
   --output /path/to/new_round/classifier.pt \
   --all-data --device cuda:0
 
 python train_supervised_agent.py train \
-  --archive /path/to/new_round/episodes.pkl \
+  --archive /path/to/source/episodes.pkl \
   --classifier /path/to/new_round/classifier.pt \
   --output /path/to/new_round/agent \
   --finetune /path/to/previous_round/agent/latest.pt \
   --skip-empty-anchors --device cuda:0
 ```
 
-Omit `--finetune` for the first cycle of a new policy. The integrated trainer
-supplies the previous cycle's checkpoint automatically after that.
+Omit `--finetune` for the first standalone cycle of a new policy. The integrated
+trainer initializes a new policy on its first cycle unless an `initial_policy`
+checkpoint is supplied, then retains the live policy and optimizer for later cycles.
+
+In the integrated trainer, source episodes are released after fitting and
+goal-prefix preparation. The goal images, anchor
+bank, and prefix lookup last only until that cycle's 100 assisted episodes
+finish. Dreamer's separate replay also stays in RAM, with a capacity of
+1 million stored transitions by default. Neither trajectory store is included
+in model checkpoints.
+
+Only the newest completed round's model directory and an in-progress round
+are retained. A successful cycle removes the previous internally created round,
+but never an externally supplied `initial_policy` checkpoint. Dreamer's
+checkpoint is replaced atomically at `<logdir>/latest.pt` after each cycle and
+at training completion. Anchor banks, prefix lookups, and counters are not
+saved as JSON dumps. Small summaries in `return_exploration/cycles.jsonl`,
+console logs, and metrics preserve the round history and all generated episode
+returns. Existing archives and old round directories from earlier versions are
+not automatically deleted. Standalone commands continue to read your supplied
+archives without changing or deleting them.
+
 `--skip-empty-anchors` reports and omits trajectories that have no extracted
 anchors from supervised fitting; it never inserts artificial goals. Those
 trajectories still belong to S and train the classifier. If no usable goals
@@ -233,13 +265,18 @@ flag, the standalone trainer retains its strict error on any empty anchor list.
 
 Supervised training still conditions on each trajectory's **full anchor
 sequence**, using the default batch size 4 and unroll length 2,048. During
-assisted collection, the return policy receives a sampled source anchor prefix
-ending at the selected target. Prefixes are inference inputs; this mode does
-not introduce additional prefix-conditioned training examples. The classifier
+assisted collection, the return policy receives a uniformly sampled matching
+source anchor prefix ending at the selected target. Each matching occurrence
+has equal probability, regardless of prefix length. Prefixes are inference
+inputs; this mode does not introduce additional prefix-conditioned training
+examples. The classifier
 checks arrival, and Dreamer then continues in the same live environment with
 context from the actual generated history. Returning successfully is not
-guaranteed. All-data checkpoints have no held-out goals; use `--split train`
-if running the standalone evaluation command on one of these checkpoints.
+guaranteed. For standalone classifiers trained with `--all-data`, use
+`--split train` when evaluating against their original archive because they
+have no held-out goals. Integrated checkpoints record a source-content
+fingerprint rather than the hash of a pickle file; the integrated run does
+not create an archive for the standalone evaluator.
 
 ## Evaluate only when training fit is satisfactory
 

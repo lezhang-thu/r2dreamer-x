@@ -2,11 +2,13 @@
 
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import torch
 from tensordict import TensorDict
 
 from trainer import OnlineTrainer
+from envs import make_envs
 
 
 def observation(index, kind=0, last=False):
@@ -147,6 +149,17 @@ class FakeReturnPhase:
 
 
 class ReturnTrainerTest(unittest.TestCase):
+    def test_no_evaluation_workers_with_legacy_positive_episode_count(self):
+        config = SimpleNamespace(env_num=1, device='cpu', eval_episode_num=10)
+        with patch('envs.parallel.ParallelEnv') as parallel_env:
+            train, evaluation, obs_space, act_space = make_envs(config)
+        parallel_env.assert_called_once()
+        self.assertEqual(parallel_env.call_args.args[1:], (1, 'cpu'))
+        self.assertIs(train, parallel_env.return_value)
+        self.assertIsNone(evaluation)
+        self.assertIs(obs_space, train.observation_space)
+        self.assertIs(act_space, train.action_space)
+
     def run_trainer(self, no_op_first=False, use_phase=True):
         events = []
         config = SimpleNamespace(steps=8 * 4, pretrain=1, eval_every=2 * 4,
@@ -167,7 +180,9 @@ class ReturnTrainerTest(unittest.TestCase):
         self.assertEqual(phase.assisted_interactions, 20000)
         self.assertEqual(len(ordinary.actions), 8)
         self.assertEqual(ordinary.resets, 1)
-        self.assertGreater(len(evaluation.actions), 0)
+        self.assertEqual(len(evaluation.actions), 0)
+        self.assertEqual(evaluation.resets, 0)
+        self.assertFalse(any(row['eval'] for row in agent.history))
         self.assertEqual(len(phase.records), 9)  # Initial frame plus eight actual actions.
         self.assertEqual([r['interactions'] for r in phase.records], list(range(9)))
         self.assertTrue(bool(phase.records[0]['previous_done'][0]))
@@ -190,6 +205,8 @@ class ReturnTrainerTest(unittest.TestCase):
         totals = [value for name, value in logger.values if name == 'return/total_interactions']
         self.assertEqual(totals, [10003., 20006.])
         baseline = self.run_trainer(use_phase=False)
+        self.assertEqual(baseline[2].resets, 0)
+        self.assertEqual(len(baseline[2].actions), 0)
         self.assertEqual(agent.updates, baseline[5].updates)
         self.assertEqual(agent.updates, 6)
 

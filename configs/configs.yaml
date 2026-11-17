@@ -30,7 +30,8 @@ buffer:
 trainer:
   steps: ${env.steps}
   pretrain: 0
-  eval_every: 1e4
+  # Legacy evaluation settings; OnlineTrainer no longer schedules evaluation.
+  eval_every: 0
   eval_episode_num: ${env.eval_episode_num}
   batch_size: ${batch_size}
   batch_length: ${batch_length}
