@@ -23,14 +23,13 @@ def make_episode(episode_id, intensities, *, complete=True):
                 complete=complete, collection_cutoff=not complete)
 
 
-def write_inputs(tmp_path, episodes):
+def write_inputs(tmp_path, episodes, model):
     archive = tmp_path / 'episodes.pkl'
     with archive.open('wb') as stream:
         pickle.dump(dict(episodes=episodes, metadata=dict(num_actions=1)), stream)
 
     # For constant gray images the stub's CLS vector contains the normalized mean.
     # This GRU retains half its previous state; the head matches |a - b| <= 0.2.
-    model = classifier.RecurrentClassifier(hidden_dim=1)
     threshold = .7
     with torch.no_grad():
         for parameter in model.parameters():
@@ -43,6 +42,7 @@ def write_inputs(tmp_path, episodes):
     ids = [ep['id'] for ep in episodes]
     torch.save(dict(kind='standalone_gru_classifier', format_version=2,
                     model_config=model.model_config, model_state=model.classifier_state_dict(),
+                    backbone_sha256=model.backbone_sha256,
                     model_fingerprint=classifier.model_fingerprint(model),
                     archive_sha256=classifier.file_sha256(archive), threshold=threshold,
                     training_episode_ids=ids[:1], evaluation_episode_ids=ids[1:]), checkpoint)
@@ -50,14 +50,14 @@ def write_inputs(tmp_path, episodes):
 
 
 @pytest.mark.parametrize('complete_only,expected_counts', [(False, [3, 2]), (True, [2, 1])])
-def test_exports_first_origins_in_archive_order(tmp_path, stub_dino, complete_only, expected_counts):
+def test_exports_first_origins_in_archive_order(tmp_path, make_dino_gru, complete_only, expected_counts):
     from export_anchor_set import main
 
     # The final frame of each episode is nearly identical. The different GRU
     # histories produce contexts A, B, C, B with A~B, B~C, A!~C.
     episodes = [make_episode(9, [90, 90, 255]), make_episode(6, [122, 255]),
                 make_episode(4, [174, 255]), make_episode(2, [122, 255], complete=False)]
-    args = write_inputs(tmp_path, episodes)
+    args = write_inputs(tmp_path, episodes, make_dino_gru(1))
     output = tmp_path / 'anchors'
     main([*args, '--output', str(output), '--feature-batch-size', '1',
           *(['--complete-only'] if complete_only else [])])
@@ -78,11 +78,33 @@ def test_exports_first_origins_in_archive_order(tmp_path, stub_dino, complete_on
             np.testing.assert_array_equal(np.asarray(image), original)
 
 
-def test_empty_set_writes_manifest_without_reset_or_terminal_png(tmp_path, stub_dino):
+def test_empty_set_writes_manifest_without_reset_or_terminal_png(tmp_path, make_dino_gru):
     from export_anchor_set import main
 
-    args = write_inputs(tmp_path, [make_episode(5, [122, 122, 122])])
+    args = write_inputs(tmp_path, [make_episode(5, [122, 122, 122])], make_dino_gru(1))
     output = tmp_path / 'empty'
     main([*args, '--output', str(output)])
     assert json.loads((output / 'manifest.json').read_text())['representatives'] == []
     assert not list(output.rglob('*.png'))
+
+
+def test_cached_export_matches_rgb_without_loading_vit(tmp_path, make_dino_gru, monkeypatch):
+    import extract_dino_features as extract
+    from export_anchor_set import main
+
+    episodes = [make_episode(9, [90, 90, 255]), make_episode(4, [174, 255])]
+    args = write_inputs(tmp_path, episodes, make_dino_gru(1))
+    features = tmp_path / 'features.pt'
+    extract.main(['--archive', str(tmp_path / 'episodes.pkl'), '--output', str(features), '--device', 'cpu'])
+    raw, cached = tmp_path / 'raw', tmp_path / 'cached'
+    main([*args, '--output', str(raw)])
+
+    def unexpected_backbone(*args, **kwargs):
+        raise AssertionError('Cached export must only read pixels to write PNGs')
+
+    monkeypatch.setattr(extract, 'load_dino_backbone', unexpected_backbone)
+    main([*args, '--features', str(features), '--output', str(cached)])
+    reps = json.loads((raw / 'manifest.json').read_text())['representatives']
+    assert reps and json.loads((cached / 'manifest.json').read_text())['representatives'] == reps
+    for rep in reps:
+        assert (cached / rep['file']).read_bytes() == (raw / rep['file']).read_bytes()

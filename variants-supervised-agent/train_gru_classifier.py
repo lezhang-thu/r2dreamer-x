@@ -7,14 +7,11 @@ starts at the episode reset, including for a trajectory cut at collection end.
 
 import argparse
 import hashlib
-import io
 import json
 import math
 from pathlib import Path
-import pickle
 import random
 import secrets
-import struct
 import time
 
 import numpy as np
@@ -24,109 +21,8 @@ from torch.nn import functional as F
 from torch.nn.utils.rnn import PackedSequence, pack_padded_sequence, pad_packed_sequence
 
 
-DEFAULT_BACKBONE = "facebook/dinov3-vitl16-pretrain-lvd1689m"
-FRAME_SHAPES = ((210, 160, 3), (84, 84, 3))
-
-
-def file_sha256(path):
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def _load_indexed_archive(stream):
-    """Map v2 pixels between the pickle header and the trailing episode index."""
-    pixel_offset = stream.tell()
-    footer_offset = stream.seek(-8, 2)
-    index_offset, = struct.unpack("<Q", stream.read(8))
-    if not pixel_offset < index_offset < footer_offset:
-        raise ValueError("Invalid native archive index offset")
-    stream.seek(index_offset)
-    index = pickle.load(stream)
-    if stream.tell() != footer_offset:
-        raise ValueError("Invalid native archive index size")
-    meta = index["metadata"]
-    shape = tuple(meta["frame_shape"])
-    count = meta["frame_count"]
-    if (shape not in FRAME_SHAPES or type(count) is not int or count <= 0
-            or count * math.prod(shape) != index_offset - pixel_offset):
-        raise ValueError("Native archive frame dimensions disagree with stored pixels")
-    frames = np.memmap(stream, mode="r", offset=pixel_offset, dtype=np.uint8, shape=(count, *shape))
-    start = 0
-    for record in index["episodes"]:
-        length = record["frame_count"]
-        if type(length) is not int or length < 2 or start + length > count:
-            raise ValueError("Invalid native archive episode length")
-        record["frames"] = frames[start:start + length]
-        start += length
-    if start != count:
-        raise ValueError("Episode index does not cover the native archive")
-    return index
-
-
-def load_archive(path):
-    """Read a trusted Atari archive or a list of episode dictionaries.
-
-    Frames are native Atari RGB or legacy RGB84. Optional actions have N entries
-    for N+1 frames, including the reset and last observed screen. The
-    classifier does not require actions, but the supervised agent does.
-    """
-    with Path(path).open("rb") as stream:
-        payload = pickle.load(stream)
-        if (isinstance(payload, dict) and payload.get("kind") == "atari_episode_archive"
-                and payload.get("format_version") == 2):
-            payload = _load_indexed_archive(stream)
-    if isinstance(payload, list):
-        records, metadata = payload, {}
-    elif isinstance(payload, dict) and isinstance(payload.get("episodes"), list):
-        if payload.get("kind") == "atari_episode_archive" and payload.get("format_version") != 1:
-            raise ValueError("Unsupported Atari archive version")
-        records, metadata = payload["episodes"], dict(payload.get("metadata", {}))
-    else:
-        raise ValueError("Expected an episode list or a dictionary with an episodes list")
-    episodes, ids = [], set()
-    for index, record in enumerate(records):
-        if not isinstance(record, dict):
-            raise ValueError("Each episode must be a dictionary")
-        episode = {key: value for key, value in record.items() if key != "payload_npz"}
-        if "payload_npz" in record:
-            with np.load(io.BytesIO(record["payload_npz"]), allow_pickle=False) as arrays:
-                episode.update({key: arrays[key] for key in arrays.files})
-        frames = np.asarray(episode.get("frames"))
-        if (frames.dtype != np.uint8 or frames.ndim != 4 or frames.shape[1:] not in FRAME_SHAPES
-                or len(frames) < 2):
-            raise ValueError("Each trajectory needs at least two uint8 RGB frames of shape 210x160x3 or 84x84x3")
-        if not episode.get("complete", True) and not episode.get("collection_cutoff", False):
-            raise ValueError("An incomplete trajectory must be marked as a collection cutoff")
-        source_id = episode.get("id", index)
-        if (not isinstance(source_id, (int, np.integer)) or isinstance(source_id, (bool, np.bool_))
-                or int(source_id) in ids):
-            raise ValueError("Episode IDs must be distinct integers")
-        episode.update(id=int(source_id), frames=np.ascontiguousarray(frames), complete=episode.get("complete", True))
-        ids.add(episode["id"])
-        for key in ("actions", "rewards", "terminated", "truncated"):
-            if episode.get(key) is None:
-                continue
-            values = np.asarray(episode[key])
-            if values.shape != (len(frames) - 1,):
-                raise ValueError(f"{key} must align with frames[t] -> frames[t+1]")
-            if key == "actions" and (not np.issubdtype(values.dtype, np.integer) or np.any(values < 0)):
-                raise ValueError("Actions must be nonnegative integer indices")
-            if key == "rewards" and not np.isfinite(values).all():
-                raise ValueError("Rewards must be finite")
-            if key in ("terminated", "truncated") and values.dtype != np.bool_:
-                raise ValueError("Termination flags must be boolean")
-            episode[key] = values
-        if "frame_count" in episode and int(episode["frame_count"]) != len(frames):
-            raise ValueError("Compressed archive frame count differs from its payload")
-        episodes.append(episode)
-    if not episodes:
-        raise ValueError("The archive contains no episodes")
-    if all("end_step" in episode for episode in episodes):
-        episodes.sort(key=lambda episode: (episode["end_step"], episode["id"]))
-    return episodes, metadata
+from atari_data import file_sha256, frames_to_tensor, load_archive, state_digest
+from extract_dino_features import DinoFrameEncoder, FEATURE_DIM, load_features
 
 
 def split_episodes(episodes, metadata, test_episodes=None, all_data=False):
@@ -158,34 +54,37 @@ def split_episodes(episodes, metadata, test_episodes=None, all_data=False):
     return train, test
 
 
-def frames_to_tensor(frames, device="cpu"):
-    frames = np.asarray(frames)
-    if frames.dtype != np.uint8 or frames.ndim != 4 or frames.shape[1:] not in FRAME_SHAPES:
-        raise ValueError("Expected uint8 RGB frames [B,210,160,3] or [B,84,84,3]")
-    return torch.from_numpy(np.array(frames, copy=True)).to(device=device, dtype=torch.float32).permute(0, 3, 1, 2).div_(255)
-
-
-class FramePairGRU(nn.Module):
-    """Map frame features to causal contexts and score context pairs."""
+class RecurrentClassifier(nn.Module):
+    """Train on per-frame CLS vectors. Attach their frozen encoder for pixel inference."""
     is_recurrent = True
 
-    def __init__(self, encoder, feature_dim, embedding_dim, hidden_dim, num_layers):
+    def __init__(self, backbone, backbone_sha256, hidden_dim=128, num_layers=1, revision=None):
         super().__init__()
-        self.encoder = encoder.eval().requires_grad_(False)
-        self.head = nn.Sequential(nn.Linear(2 * embedding_dim, 128), nn.ReLU(), nn.Linear(128, 1))
-        self.embedding_dim, self.hidden_dim, self.num_layers = embedding_dim, hidden_dim, num_layers
-        self.gru = nn.GRU(feature_dim, hidden_dim, num_layers=num_layers, batch_first=True)
-        self.projection = nn.Identity() if hidden_dim == embedding_dim else nn.Linear(hidden_dim, embedding_dim)
+        self.model_config = dict(backbone=backbone, revision=revision, hidden_dim=hidden_dim, num_layers=num_layers)
+        self.backbone_sha256 = backbone_sha256
+        self.hidden_dim, self.num_layers = hidden_dim, num_layers
+        self.head = nn.Sequential(nn.Linear(2 * hidden_dim, 128), nn.ReLU(), nn.Linear(128, 1))
+        self.gru = nn.GRU(FEATURE_DIM, hidden_dim, num_layers=num_layers, batch_first=True)
+        self.encoder = None
+
+    def attach_encoder(self, encoder):
+        if encoder.backbone_sha256 != self.backbone_sha256:
+            raise ValueError("DINOv3 encoder weights differ from the feature source")
+        self.encoder = encoder.to(self.gru.weight_ih_l0.device).eval().requires_grad_(False)
 
     def pair_logits(self, first, second):
         return self.head(torch.cat(((first - second).abs(), first * second), dim=-1)).squeeze(-1)
 
     def train(self, mode=True):
         super().train(mode)
-        self.encoder.eval()
+        if self.encoder is not None:
+            self.encoder.eval()
         return self
 
+    @torch.no_grad()
     def encode_visual(self, images):
+        if self.encoder is None:
+            raise ValueError("RGB inference requires the DINOv3 encoder")
         return self.encoder(images)
 
     def encode_features(self, features, hidden=None, lengths=None):
@@ -197,75 +96,25 @@ class FramePairGRU(nn.Module):
         if hidden.shape != (self.num_layers, batch, self.hidden_dim):
             raise ValueError("Wrong recurrent hidden-state shape")
         if not steps:
-            return features.new_zeros((batch, 0, self.embedding_dim)), hidden
+            return features.new_zeros((batch, 0, self.hidden_dim)), hidden
         if lengths is None:
-            output, state = self.gru(features, hidden)
-            return self.projection(output), state
+            return self.gru(features, hidden)
         lengths = torch.as_tensor(lengths, dtype=torch.long, device=features.device)
         if lengths.shape != (batch,) or torch.any(lengths < 0) or torch.any(lengths > steps):
             raise ValueError("Invalid sequence lengths")
         nonempty = lengths > 0
-        output, state = features.new_zeros((batch, steps, self.embedding_dim)), hidden.clone()
+        output, state = features.new_zeros((batch, steps, self.hidden_dim)), hidden.clone()
         if nonempty.any():
             packed = pack_padded_sequence(features[nonempty], lengths[nonempty].cpu(), batch_first=True, enforce_sorted=False)
             encoded, next_state = self.gru(packed, hidden[:, nonempty].contiguous())
             values, _ = pad_packed_sequence(encoded, batch_first=True, total_length=steps)
-            valid = torch.arange(steps, device=features.device)[None] < lengths[nonempty, None]
-            output[nonempty] = self.projection(values) * valid[..., None]
+            output[nonempty] = values
             state[:, nonempty] = next_state
         return output, state
 
     def encode_step(self, images, hidden=None):
         output, state = self.encode_features(self.encode_visual(images)[:, None], hidden)
         return output[:, 0], state
-
-
-def legacy_classifier(config):
-    from legacy_classifier import make_encoder
-
-    dim = config["embedding_dim"]
-    model = FramePairGRU(make_encoder(config["architecture"], dim), dim, dim,
-                         config["hidden_dim"], config["num_layers"])
-    model.model_config = dict(config)
-    return model
-
-
-def load_dino_backbone(source, revision=None):
-    from transformers import AutoModel
-
-    return AutoModel.from_pretrained(source, revision=revision)
-
-
-class RecurrentClassifier(FramePairGRU):
-    """A frozen, externally stored ViT-L/16 followed directly by a trainable GRU."""
-
-    def __init__(self, backbone=DEFAULT_BACKBONE, hidden_dim=128, num_layers=1, revision=None):
-        if Path(backbone).is_dir():
-            backbone = str(Path(backbone).resolve())
-        encoder = load_dino_backbone(backbone, revision=revision)
-        config = encoder.config
-        if (config.model_type, config.patch_size, config.hidden_size, config.num_hidden_layers) != (
-                "dinov3_vit", 16, 1024, 24):
-            raise ValueError("--backbone must be a pretrained DINOv3 ViT-L/16 model")
-        super().__init__(encoder, config.hidden_size, hidden_dim, hidden_dim, num_layers)
-        self.model_config = dict(backbone=backbone, revision=getattr(config, "_commit_hash", None) or revision,
-                                 hidden_dim=hidden_dim, num_layers=num_layers)
-        # Identify even local, unversioned weights, without rehashing the ViT at every update.
-        self.backbone_sha256 = state_digest(hashlib.sha256(), encoder.state_dict()).hexdigest()
-        self.register_buffer("rgb_mean", torch.tensor([.485, .456, .406]).view(1, 3, 1, 1), persistent=False)
-        self.register_buffer("rgb_std", torch.tensor([.229, .224, .225]).view(1, 3, 1, 1), persistent=False)
-
-    @torch.no_grad()
-    def encode_visual(self, images):
-        # Center the untouched screen on a patch-aligned black canvas.
-        height_pad, width_pad = -images.shape[-2] % 16, -images.shape[-1] % 16
-        padded = F.pad(images, (width_pad // 2, width_pad - width_pad // 2,
-                                height_pad // 2, height_pad - height_pad // 2))
-        pixels = (padded - self.rgb_mean) / self.rgb_std
-        use_bfloat16 = pixels.is_cuda and torch.cuda.get_device_capability(pixels.device)[0] >= 8
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_bfloat16):
-            cls = self.encoder(pixel_values=pixels).pooler_output
-        return cls.float()
 
     def classifier_state_dict(self):
         return {name: value for name, value in self.state_dict().items() if not name.startswith("encoder.")}
@@ -289,12 +138,18 @@ def encode_trajectory(model, frames, device="cpu", batch_size=1):
     return torch.cat(pieces)
 
 
-def state_digest(digest, state):
-    for name, tensor in state.items():
-        value = tensor.detach().cpu().contiguous()
-        digest.update(f"{name}:{value.dtype}:{tuple(value.shape)}:".encode())
-        digest.update(memoryview(value.reshape(-1).view(torch.uint8).numpy()))
-    return digest
+@torch.no_grad()
+def encode_feature_trajectory(model, features, device="cpu", batch_size=256):
+    """Unroll one episode of stored CLS vectors from reset, preserving state between chunks."""
+    if batch_size < 1 or len(features) < 1:
+        raise ValueError("Need a positive batch size and nonempty features")
+    model.eval()
+    pieces, hidden = [], None
+    for start in range(0, len(features), batch_size):
+        chunk = features[start:start + batch_size].to(device)
+        encoded, hidden = model.encode_features(chunk.unsqueeze(0), hidden)
+        pieces.append(encoded[0].cpu())
+    return torch.cat(pieces)
 
 
 def model_fingerprint(model):
@@ -305,20 +160,19 @@ def model_fingerprint(model):
     return state_digest(digest, model.state_dict()).hexdigest()
 
 
-def load_classifier(path, device="cpu"):
+def load_classifier(path, device="cpu", *, load_encoder=True):
     saved = torch.load(path, map_location="cpu", weights_only=True)
-    if saved.get("kind") != "standalone_gru_classifier" or saved.get("format_version") not in (1, 2):
-        raise ValueError("Use a classifier checkpoint produced by train_gru_classifier.py")
-    if saved["format_version"] == 1:
-        model = legacy_classifier(saved["model_config"])
-        model.load_state_dict(saved["model_state"])
-    else:
-        model = RecurrentClassifier(**saved["model_config"])
-        model.load_classifier_state(saved["model_state"])
-    model.to(device)
-    model.eval().requires_grad_(False)
+    if saved.get("kind") != "standalone_gru_classifier" or saved.get("format_version") != 2:
+        raise ValueError("Expected a DINOv3 GRU classifier checkpoint")
+    model = RecurrentClassifier(**saved["model_config"], backbone_sha256=saved["backbone_sha256"])
+    model.load_classifier_state(saved["model_state"])
     if model_fingerprint(model) != saved["model_fingerprint"]:
         raise ValueError("Classifier state does not match its saved fingerprint")
+    model.to(device)
+    if load_encoder:
+        config = saved["model_config"]
+        model.attach_encoder(DinoFrameEncoder(config["backbone"], revision=config["revision"]))
+    model.eval().requires_grad_(False)
     return model, saved
 
 
@@ -396,7 +250,7 @@ def sampled_embeddings(model, features, sampler, indices, device, tbptt_chunk=0)
         selected = np.flatnonzero((local >= start) & (local < start + chunk_size))
         if len(selected):
             rows = offsets[local[selected] - start] + ranks[selected]
-            contexts.append(model.projection(output.data[torch.as_tensor(rows, device=device)]))
+            contexts.append(output.data[torch.as_tensor(rows, device=device)])
             positions.append(selected)
     restore_order = torch.as_tensor(np.argsort(np.concatenate(positions)), device=device)
     return torch.cat(contexts)[restore_order]
@@ -424,13 +278,6 @@ def evaluate_pairs(model, data, sampler, pairs, device):
                 positive_recall=float(predicted[positive].float().mean()), negative_recall=float((~predicted[~positive]).float().mean()))
 
 
-@torch.no_grad()
-def cache_features(model, episodes, device, batch_size=16):
-    model.eval()
-    return [torch.cat([model.encode_visual(frames_to_tensor(frames[start:start + batch_size], device)).cpu()
-                       for start in range(0, len(frames), batch_size)]) for frames in episodes]
-
-
 def atomic_save(path, payload):
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, temporary)
@@ -442,14 +289,11 @@ def copy_model_state(model):
     return {name: tensor.detach().to('cpu', copy=True) for name, tensor in model.state_dict().items()}
 
 
-def parse_args(argv=None, *, require_archive=True):
+def parse_args(argv=None, *, require_features=True):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--archive", type=Path, required=require_archive)
+    parser.add_argument("--features", type=Path, required=require_features,
+                        help="Embedding file from extract_dino_features.py")
     parser.add_argument("--output", type=Path, required=True, help="Final recurrent classifier .pt file")
-    parser.add_argument("--backbone", default=DEFAULT_BACKBONE,
-                        help="Hugging Face model ID or local ViT-L/16 pretrained model directory")
-    parser.add_argument("--feature-batch-size", type=int, default=16,
-                        help="Frames per frozen DINO forward pass")
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--gru-steps", type=int, default=5000)
     parser.add_argument("--gru-learning-rate", type=float, default=1e-3)
@@ -470,13 +314,9 @@ def parse_args(argv=None, *, require_archive=True):
     return parser.parse_args(argv)
 
 
-def train_from_episodes(args, episodes, metadata, source_sha256):
-    """Fit a fresh classifier directly on shared episode arrays.
-
-    This is the online integration entry point. It never reads an archive or
-    reloads its own checkpoints. The caller owns RNG/thread isolation.
-    """
-    for name in ("feature_batch_size", "hidden_dim", "gru_steps", "window", "negative_ratio", "threads", "eval_every"):
+def train_from_features(args, episodes, metadata, provenance):
+    """Fit the GRU on stored or in-memory DINOv3 feature sequences."""
+    for name in ("hidden_dim", "gru_steps", "window", "negative_ratio", "threads", "eval_every"):
         if getattr(args, name) < 1:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
     if (not 0 < args.validation_fraction < 1 or args.tbptt_chunk < 0
@@ -485,8 +325,8 @@ def train_from_episodes(args, episodes, metadata, source_sha256):
     if any(value < args.negative_ratio + 1 or value % (args.negative_ratio + 1) for value in (args.batch_size, args.eval_pairs)):
         raise ValueError("--batch-size and --eval-pairs must be positive multiples of negative_ratio + 1")
     report_path = args.output.with_name(args.output.stem + ".metrics.json")
-    if args.archive is not None and args.archive.resolve() in {path.resolve() for path in (args.output, report_path)}:
-        raise ValueError("Classifier output files must not replace the input archive")
+    if args.features is not None and args.features.resolve() in {path.resolve() for path in (args.output, report_path)}:
+        raise ValueError("Classifier output files must not replace the feature file")
     if any(path.exists() for path in (args.output, report_path)) and not args.overwrite:
         raise FileExistsError("Choose fresh output paths or supply --overwrite")
     args.seed = secrets.randbelow(2**32) if args.seed is None else args.seed
@@ -510,25 +350,26 @@ def train_from_episodes(args, episodes, metadata, source_sha256):
         selection_ids = validation_ids
         selection_scope = "heldout_validation_episodes"
     by_id = {episode["id"]: episode for episode in episodes}
-    fit_frames = [by_id[index]["frames"] for index in fit_ids]
-    validation_frames = [by_id[index]["frames"] for index in selection_ids]
+    fit_features = [by_id[index]["features"] for index in fit_ids]
+    validation_features = [by_id[index]["features"] for index in selection_ids]
     config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
     config.update(resolved_device=device, negative_mode="within_episode_random", frame_encoder="dinov3_vitl16_cls",
-                  preprocessing="symmetric_black_pad16_imagenet", visual_encoder_frozen=True)
-    provenance = dict(archive_sha256=source_sha256, training_episode_ids=train_ids,
+                  preprocessing=provenance["preprocessing"])
+    training_info = dict(archive_sha256=provenance["archive_sha256"], training_episode_ids=train_ids,
                       evaluation_episode_ids=test_ids, internal_train_ids=fit_ids, internal_validation_ids=validation_ids,
                       diagnostic_episode_ids=fit_ids if args.all_data else [], selection_scope=selection_scope,
                       train_config=config, threshold=.5)
+    if "features_sha256" in provenance:
+        training_info["features_sha256"] = provenance["features_sha256"]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     history, started = [], time.monotonic()
     print(json.dumps(dict(event="start", device=device, seed=args.seed, fit_episodes=len(fit_ids),
                           validation_episodes=len(validation_ids), heldout_episodes=len(test_ids),
                           selection_scope=selection_scope)), flush=True)
 
-    recurrent = RecurrentClassifier(args.backbone, hidden_dim=args.hidden_dim).to(device)
-    fit_features = cache_features(recurrent, fit_frames, device, batch_size=args.feature_batch_size)
-    validation_features = (fit_features if args.all_data else
-                           cache_features(recurrent, validation_frames, device, batch_size=args.feature_batch_size))
+    recurrent = RecurrentClassifier(
+        backbone=provenance["backbone"], revision=provenance["revision"],
+        backbone_sha256=provenance["backbone_sha256"], hidden_dim=args.hidden_dim).to(device)
     print(json.dumps(dict(event="features_ready", fit_frames=sum(map(len, fit_features)),
                           feature_dim=recurrent.gru.input_size)), flush=True)
     optimizer = torch.optim.AdamW((p for p in recurrent.parameters() if p.requires_grad),
@@ -567,9 +408,9 @@ def train_from_episodes(args, episodes, metadata, source_sha256):
                                   backbone_sha256=recurrent.backbone_sha256,
                                   model_fingerprint=model_fingerprint(recurrent),
                                   sampler_rng_state=sampler.rng.bit_generator.state,
-                                  step=step, metrics=metrics, **provenance)
+                                  step=step, metrics=metrics, **training_info)
                 atomic_save(args.output, dict(checkpoint, optimizer_state=optimizer.state_dict()))
-            report_path.write_text(json.dumps(dict(**provenance, history=history), indent=2) + "\n")
+            report_path.write_text(json.dumps(dict(**training_info, history=history), indent=2) + "\n")
     recurrent.load_classifier_state(checkpoint["model_state"])
     recurrent.zero_grad(set_to_none=True)
     recurrent.eval().requires_grad_(False)
@@ -583,8 +424,9 @@ def main(argv=None):
     if args.threads < 1:
         raise ValueError('--threads must be positive')
     torch.set_num_threads(args.threads)
-    episodes, metadata = load_archive(args.archive)
-    return train_from_episodes(args, episodes, metadata, file_sha256(args.archive))
+    episodes, metadata, provenance = load_features(args.features)
+    provenance["features_sha256"] = file_sha256(args.features)
+    return train_from_features(args, episodes, metadata, provenance)
 
 
 if __name__ == "__main__":

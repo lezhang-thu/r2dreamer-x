@@ -40,7 +40,7 @@ class ReturnCycleTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = Path(temporary.name).resolve()
         self.config = OmegaConf.create(dict(interval=100, episodes=2, initial_policy=None,
                                             classifier=dict(window=20), policy=dict(updates=10000)))
         self.env_config = OmegaConf.create(dict(env_num=1, gray=False, lives='unused', seed=7,
@@ -70,7 +70,7 @@ class ReturnCycleTests(unittest.TestCase):
 
     def train_classifier(self, args, episodes, metadata, source_sha256):
         self.training_calls.append(('classifier', args))
-        self.assertIsNone(args.archive)
+        self.assertIsNone(args.features)
         self.assertTrue(args.all_data)
         self.assertIs(metadata, self.cycle.archive.metadata)
         self.assertEqual(source_sha256, self.cycle.archive.fingerprint())
@@ -85,9 +85,10 @@ class ReturnCycleTests(unittest.TestCase):
                           archive_sha256=source_sha256,
                           training_episode_ids=[episode['id'] for episode in episodes])
         torch.save(checkpoint, args.output)
-        return classifier, checkpoint
+        return classifier, checkpoint, {ep['id']: None for ep in episodes}
 
-    def demonstrations(self, episodes, ids, classifier, threshold, device, skip_empty):
+    def demonstrations(self, episodes, ids, classifier, threshold, device, skip_empty, features_by_id):
+        self.assertEqual(set(ids), set(features_by_id))
         self.preparation_rounds.append(self.cycle.round)
         self.assertIs(episodes, self.current_episodes)
         self.assertTrue(skip_empty)
@@ -182,12 +183,11 @@ class ReturnCycleTests(unittest.TestCase):
 
     @contextmanager
     def runtime(self, train_policy=None, collect=None):
-        classifier_module = SimpleNamespace(parse_args=self.classifier_module.parse_args,
-                                             train_from_episodes=self.train_classifier)
         supervised_module = SimpleNamespace(parse_args=self.supervised_module.parse_args,
                                               prepare_demonstrations=self.demonstrations,
                                               train_from_demonstrations=train_policy or self.train_policy)
-        with patch('return_exploration.variant_modules', return_value=(classifier_module, supervised_module)), \
+        with patch.object(self.cycle, '_fit_classifier', new=self.train_classifier), \
+                patch('return_exploration.variant_modules', return_value=(self.classifier_module, supervised_module)), \
                 patch('return_exploration.collect_assisted_episode', side_effect=collect or self.collect), \
                 patch('envs.make_env', side_effect=self.make_env), \
                 patch('return_exploration.torch.cuda.is_available', return_value=False), \

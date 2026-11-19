@@ -222,6 +222,18 @@ class ReturnExploration:
             return self._fit_episodes(directory, ordinary_interactions, episodes,
                                       source_ids, source_hash)
 
+    def _fit_classifier(self, args, episodes, metadata, source_sha256):
+        # variant_modules() puts the standalone modules on the import path.
+        from extract_dino_features import DEFAULT_BACKBONE, DinoFrameEncoder, extract_episodes
+        from train_gru_classifier import train_from_features
+
+        config = self.config.classifier
+        encoder = DinoFrameEncoder(config.get('backbone', DEFAULT_BACKBONE)).to(self.device).eval()
+        features = extract_episodes(episodes, encoder, self.device, config.get('feature_batch_size', 16))
+        classifier, checkpoint = train_from_features(args, features, metadata, encoder.provenance(source_sha256))
+        classifier.attach_encoder(encoder)
+        return classifier, checkpoint, {ep['id']: ep['features'] for ep in features}
+
     def _fit_episodes(self, directory, ordinary_interactions, episodes, source_ids, source_hash):
         classifier_module, supervised = variant_modules()
         save_json(directory / 'plan.json', dict(source_ids=source_ids, episodes=self.episodes,
@@ -232,17 +244,20 @@ class ReturnExploration:
         classifier_path = directory / 'classifier.pt'
         classifier_args = ['--output', str(classifier_path), '--device', self.device, '--all-data']
         for key, value in self.config.classifier.items():
+            if key in ('backbone', 'feature_batch_size'):
+                continue
             classifier_args.extend(['--' + key.replace('_', '-'), str(value)])
-        classifier_args = classifier_module.parse_args(classifier_args, require_archive=False)
-        classifier, checkpoint = self._train(
-            'classifier', classifier_module.train_from_episodes, classifier_args,
+        classifier_args = classifier_module.parse_args(classifier_args, require_features=False)
+        classifier, checkpoint, features_by_id = self._train(
+            'classifier', self._fit_classifier, classifier_args,
             directory / 'classifier.log', episodes=episodes, metadata=self.archive.metadata,
             source_sha256=source_hash)
 
         # Extract once: policy fitting and the anchor bank share these demos.
         demos = supervised.prepare_demonstrations(
             episodes, checkpoint['training_episode_ids'], classifier, checkpoint['threshold'],
-            self.device, skip_empty=True)
+            self.device, skip_empty=True, features_by_id=features_by_id)
+        del features_by_id
         policy_output = directory / 'agent'
         policy_args = ['train', '--output', str(policy_output), '--device', self.device,
                        '--skip-empty-anchors']

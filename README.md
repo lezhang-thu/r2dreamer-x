@@ -61,30 +61,42 @@ Allow roughly 10.1 GB for the archive and additional space for the Dreamer
 checkpoint and logs. The writer builds the final archive in place under a
 temporary name and publishes it when collection finishes.
 
-To fit the GRU on all collected trajectories, pass `--all-data`. Use a fresh output path for each experiment.
+Extract one 1,024-dimensional DINOv3 CLS vector per frame. Each GRU experiment
+can reuse the resulting float32 file. The vectors occupy 409.6 MB for 100,000
+post-action frames, plus 4,096 bytes per reset frame.
+
+```bash
+python variants-supervised-agent/extract_dino_features.py \
+  --archive logdir/montezuma_100k_0/episodes.pkl \
+  --output logdir/montezuma_100k_0/embeddings.pt --device cuda:0
+```
+
+The extraction step needs access to the [DINOv3 ViT-L/16 pretrained weights](https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m).
+Authenticate on the training machine or point the extractor's `--backbone` at
+a local Hugging Face snapshot.
+
+To fit the GRU on all collected trajectories, pass `--all-data`. Use a fresh
+classifier output path for each experiment and reuse `embeddings.pt`.
 
 ```bash
 python variants-supervised-agent/train_gru_classifier.py \
-  --archive logdir/montezuma_100k_0/episodes.pkl \
+  --features logdir/montezuma_100k_0/embeddings.pt \
   --output logdir/montezuma_100k_0/gru-run1/classifier.pt \
   --all-data --seed 0 --device cuda:0
 ```
-
-The classifier needs access to the [DINOv3 ViT-L/16 pretrained weights](https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m).
-Accept the model terms and authenticate on the training machine, or supply
-`--backbone /path/to/local/huggingface-snapshot`. See the
-[classifier guide](variants-supervised-agent/README.md) for splits and preprocessing.
 
 After training, export the merged anchor set for visual inspection.
 
 ```bash
 python variants-supervised-agent/export_anchor_set.py \
   --archive logdir/montezuma_100k_0/episodes.pkl \
+  --features logdir/montezuma_100k_0/embeddings.pt \
   --classifier logdir/montezuma_100k_0/gru-run1/classifier.pt \
   --output logdir/montezuma_100k_0/gru-run1/anchor_set --device cuda:0
 ```
 
-The output contains one native-resolution RGB PNG per representative. Its
+The exporter scores the saved features and reads each selected RGB frame from
+`episodes.pkl`. The output contains one native-resolution RGB PNG per representative. Its
 `manifest.json` maps each image back to its episode and frame number. By
 default, every collected trajectory contributes, including a final cutoff
 prefix. Pass `--complete-only` to apply the online cycle's source-selection rule.
@@ -169,10 +181,9 @@ Trajectory data stays in memory. Dreamer's replay uses CPU RAM by default and
 is limited to 1 million stored transitions; it is not saved to disk. The
 return-exploration pool keeps compressed completed episodes in RAM until their
 next phase. The classifier and return policy train sequentially inside the
-main Dreamer process. Each source episode is decoded once, replacing its
-compressed record, and the same episode arrays are passed directly to the
-classifier, policy preparation, and anchor-prefix preparation. There are no
-auxiliary training subprocesses, memory-file snapshots, or trajectory archives.
+main Dreamer process. Each cycle decodes its source episodes and extracts one
+DINOv3 vector per frame in memory. The GRU fit and anchor selection reuse
+those vectors. The policy uses the decoded source images and actions.
 Once fitting and goal-prefix preparation finish, the source episodes are
 released. Only the goal images, anchor bank, and prefix lookup remain until
 the 100 assisted episodes finish. Those newly generated episodes, together

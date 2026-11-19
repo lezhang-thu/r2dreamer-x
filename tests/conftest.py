@@ -10,7 +10,7 @@ def stub_dino(monkeypatch):
     import torch
 
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / 'variants-supervised-agent'))
-    import train_gru_classifier as classifier
+    import extract_dino_features as extract
 
     batches = []
 
@@ -24,5 +24,20 @@ def stub_dino(monkeypatch):
             vector = pixel_values.mean(dim=(1, 2, 3))[:, None].expand(-1, 1024)
             return SimpleNamespace(pooler_output=vector)
 
-    monkeypatch.setattr(classifier, 'load_dino_backbone', lambda source, revision=None: TinyEncoder())
+    monkeypatch.setattr(extract, 'load_dino_backbone', lambda source, revision=None: TinyEncoder())
     return batches
+
+
+@pytest.fixture
+def make_dino_gru(stub_dino):
+    import extract_dino_features as extract
+    from train_gru_classifier import RecurrentClassifier
+
+    def make_model(hidden_dim):
+        encoder = extract.DinoFrameEncoder()
+        model = RecurrentClassifier(backbone=encoder.backbone, backbone_sha256=encoder.backbone_sha256,
+                                    hidden_dim=hidden_dim, revision=encoder.revision)
+        model.attach_encoder(encoder)
+        return model
+
+    return make_model

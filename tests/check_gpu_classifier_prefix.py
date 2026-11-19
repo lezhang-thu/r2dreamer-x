@@ -17,6 +17,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--repo', type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument('--archive', type=Path, required=True)
+    parser.add_argument('--features', type=Path, required=True)
     parser.add_argument('--classifier', type=Path, required=True)
     parser.add_argument('--policy', type=Path)
     parser.add_argument('--output', type=Path, required=True)
@@ -29,11 +30,12 @@ def main():
     from torch.nn import functional as F
     import train_gru_classifier as classifier_module
     import train_supervised_agent as supervised
+    from export_anchor_set import load_matching_features
 
     assert torch.cuda.is_available()
     torch.set_num_threads(4)
     device = 'cuda:0'
-    paths = dict(archive=args.archive, classifier=args.classifier)
+    paths = dict(archive=args.archive, features=args.features, classifier=args.classifier)
     if args.policy:
         paths['policy'] = args.policy
     assert args.output.resolve() not in [path.resolve() for path in paths.values()]
@@ -56,11 +58,12 @@ def main():
         episodes, metadata = classifier_module.load_archive(args.archive)
         source = max(episodes, key=lambda ep: len(ep['frames']))
         assert len(source['frames']) >= 27001
+        classifier, checkpoint = classifier_module.load_classifier(args.classifier, device, load_encoder=False)
+        assert hashes['archive'] == checkpoint['archive_sha256']
+        features = load_matching_features(args.features, episodes, checkpoint)[source['id']]
         del episodes
-        classifier, checkpoint = classifier_module.load_classifier(args.classifier, device)
         report.update(source_episode_id=source['id'], source_frames=len(source['frames']))
         started = time.monotonic()
-        features = classifier_module.cache_features(classifier, [source['frames']], device)[0]
         logical_episodes = [features] * 100
         sampler = classifier_module.PairSampler(logical_episodes, window=20, negative_ratio=1, seed=13)
         first, second, labels = sampler.sample(64)
@@ -69,7 +72,6 @@ def main():
         indices = np.concatenate((first, second))
         episode_ids, local = sampler.locate(indices)
         classifier.gru.requires_grad_(True)
-        classifier.projection.requires_grad_(True)
         classifier.head.requires_grad_(True)
         classifier.train()
         optimizer = torch.optim.AdamW((p for p in classifier.parameters() if p.requires_grad),

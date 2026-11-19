@@ -22,9 +22,8 @@ from torch.nn import functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence, pad_sequence
 from torch.utils.checkpoint import checkpoint as recompute
 
-from legacy_classifier import make_encoder
-from train_gru_classifier import (copy_model_state, encode_trajectory, file_sha256, frames_to_tensor,
-                                  load_archive, load_classifier, model_fingerprint)
+from train_gru_classifier import (copy_model_state, encode_feature_trajectory, encode_trajectory,
+                                  file_sha256, frames_to_tensor, load_archive, load_classifier, model_fingerprint)
 
 
 def require(condition, message):
@@ -63,7 +62,8 @@ def extract_anchor_indices(classifier, contexts, threshold):
 
 
 @torch.no_grad()
-def prepare_demonstrations(episodes, ids, classifier, threshold, device='cpu', skip_empty=False):
+def prepare_demonstrations(episodes, ids, classifier, threshold, device='cpu', skip_empty=False,
+                           *, features_by_id=None):
     """Extract full anchor lists; action cloning does not use progress labels."""
     by_id = {episode['id']: episode for episode in episodes}
     demos = []
@@ -73,7 +73,13 @@ def prepare_demonstrations(episodes, ids, classifier, threshold, device='cpu', s
         frames, actions = source['frames'], source.get('actions')
         require(actions is not None and len(actions) == len(frames) - 1,
                 f'Episode {episode_id}: supervised cloning requires recorded aligned actions')
-        contexts = encode_trajectory(classifier, frames, device=device, batch_size=16).to(device)
+        if features_by_id is None:
+            contexts = encode_trajectory(classifier, frames, device=device, batch_size=16)
+        else:
+            features = features_by_id[episode_id]
+            require(len(features) == len(frames), f'Episode {episode_id}: features and frames must align')
+            contexts = encode_feature_trajectory(classifier, features, device=device)
+        contexts = contexts.to(device)
         indices = extract_anchor_indices(classifier, contexts, threshold)
         # No synthetic terminal anchor is inserted to hide a degenerate classifier.
         if not indices and skip_empty:
@@ -100,7 +106,10 @@ class GoalPolicy(nn.Module):
                 and hidden_dim % attention_heads == 0, 'Invalid policy dimensions')
         self.model_config = dict(num_actions=num_actions, hidden_dim=hidden_dim, attention_heads=attention_heads)
         self.num_actions, self.hidden_dim, self.heads = num_actions, hidden_dim, attention_heads
-        self.vision = make_encoder('small', hidden_dim)
+        self.vision = nn.Sequential(
+            nn.Conv2d(3, 16, 5, 2, 2), nn.ReLU(), nn.Conv2d(16, 32, 3, 2, 1), nn.ReLU(),
+            nn.Conv2d(32, 64, 3, 2, 1), nn.ReLU(), nn.Conv2d(64, 64, 3, 2, 1), nn.ReLU(),
+            nn.AdaptiveAvgPool2d((4, 4)), nn.Flatten(), nn.Linear(64 * 4 * 4, hidden_dim))
         self.visual_norm = nn.LayerNorm(hidden_dim)
         self.goal_norm = nn.LayerNorm(hidden_dim)
         self.anchor_gru = nn.GRU(hidden_dim, hidden_dim, batch_first=True)
@@ -213,8 +222,8 @@ def score_training(policy, demos, unroll_length):
                 scope='Teacher-forced training observations; not rollout anchor LCS')
 
 
-def load_inputs(archive, classifier_path, device):
-    classifier, checkpoint = load_classifier(classifier_path, device)
+def load_inputs(archive, classifier_path, device, *, load_encoder=True):
+    classifier, checkpoint = load_classifier(classifier_path, device, load_encoder=load_encoder)
     require(checkpoint['archive_sha256'] == file_sha256(archive), 'Classifier was trained on a different archive')
     episodes, metadata = load_archive(archive)
     train_ids, test_ids = checkpoint['training_episode_ids'], checkpoint['evaluation_episode_ids']

@@ -1,25 +1,20 @@
 # GRU classifier and supervised goal-conditioned agent
 
-This directory has two training entry points.
+The standalone workflow uses three files.
 
-1. **`train_gru_classifier.py`** reads trajectories from a `.pkl`, trains the
-   temporal similarity classifier, and saves its checkpoint.
-2. **`train_supervised_agent.py`** reads the same `.pkl` and that checkpoint,
-   extracts anchors, trains a supervised policy, and evaluates it in Atari.
+| File | Contents | Used by |
+|---|---|---|
+| `episodes.pkl` | Original RGB screens and aligned trajectory data | Feature extraction, anchor PNG export, supervised policy |
+| `embeddings.pt` | One 1,024-value float32 DINOv3 CLS vector per screen, grouped by episode | GRU training and anchor selection |
+| `classifier.pt` | Trained GRU, similarity head, split and source fingerprints | Anchor selection and supervised policy |
 
-The second module imports shared archive/model utilities from the first. Keep the sibling Python modules together. They have no imports from the original project and do
-not require R2-Dreamer, its world model, A2C, SAC, or the augmentation experiments.
-
-## Input: an existing trajectory pickle
-
-The standalone commands below accept an existing trajectory pickle through
-`--archive`. They do not require the main R2-Dreamer trainer to create one.
+## Input trajectories
 
 With periodic return exploration enabled, the main trainer keeps completed
 source trajectories compressed in RAM. It calls the classifier and policy
-training functions directly in the same process. Each episode in the cycle's
-set S is decoded once, replacing its compressed record; the same arrays are
-shared by classifier fitting, policy preparation, and anchor-prefix setup.
+training functions directly in the same process. Each cycle decodes its source episodes once. GRU fitting and anchor selection
+share the extracted DINOv3 vectors in memory. The decoded frames and actions
+supply the supervised policy examples.
 No training subprocess, memory-file snapshot, or trajectory pickle is needed.
 The in-memory data includes aligned executed actions, the action count, and
 environment preprocessing configuration, so no `--num-actions` or
@@ -45,7 +40,7 @@ reader maps the pixels read-only and exposes a NumPy array for each trajectory.
 For example, from this directory:
 
 ```python
-from train_gru_classifier import load_archive
+from atari_data import load_archive
 
 episodes, metadata = load_archive("../logdir/montezuma_100k_0/episodes.pkl")
 assert sum(len(ep["actions"]) for ep in episodes) == 100_000
@@ -71,7 +66,7 @@ arrays. Each episode contains:
 | `reset_seed` | Original reset seed, when available |
 | `complete` | False with `collection_cutoff=True` for the final live prefix of a native run |
 
-The classifier needs frames only. Supervised action learning requires the
+DINOv3 feature extraction needs the frames only. Supervised action learning requires the
 recorded actions; it does not infer them from images. Optional rewards and end
 flags are preserved but are not supervision targets.
 
@@ -88,6 +83,20 @@ the agent trainer. Environment evaluation also needs the source preprocessing
 configuration, either in `metadata.env_config` or via `--env-config` with a JSON
 object. The configuration must describe how the source images were produced.
 
+## Extract the DINOv3 features once
+
+```bash
+python variants-supervised-agent/extract_dino_features.py \
+  --archive logdir/montezuma_100k_0/episodes.pkl \
+  --output logdir/montezuma_100k_0/embeddings.pt --device cuda:0
+```
+
+The extractor preserves episode IDs, their order, split metadata, and all frames
+from reset through the final screen, including collection cutoffs. Frame index
+`t` in an episode's feature tensor identifies frame `t` in its RGB array.
+`--feature-batch-size` controls how many frames go through DINOv3 at once
+(default 16). The file records the source archive hash, backbone and preprocessing.
+
 ## Step 1: train the GRU classifier
 
 From the repository root, after collecting the MontezumaRevenge archive, run
@@ -95,14 +104,14 @@ From the repository root, after collecting the MontezumaRevenge archive, run
 ```bash
 conda activate r2dreamer
 python variants-supervised-agent/train_gru_classifier.py \
-  --archive logdir/montezuma_100k_0/episodes.pkl \
+  --features logdir/montezuma_100k_0/embeddings.pt \
   --output logdir/montezuma_100k_0/gru-run1/classifier.pt \
   --gru-steps 5000 --window 20 --seed 0 --device cuda:0
 ```
 
 The frozen backbone is Meta's [DINOv3 ViT-L/16](https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m).
 Authenticate with an account that has access to the weights, or supply a local
-Hugging Face snapshot directory through `--backbone`. A native 210×160 screen
+Hugging Face snapshot directory to the extractor through `--backbone`. A native 210×160 screen
 gets seven black rows above and below and ImageNet channel normalization. The
 resulting 224×160 image has a 14×10 patch grid. The classifier takes one
 1,024-dimensional final CLS vector per frame and feeds it directly to a causal
@@ -117,19 +126,20 @@ The temporal skip-gram labels are:
   frame positions independently and uniformly within it. Nearby pairs and
   identical positions are allowed. No far-away exclusion is applied.
 
-Each run extracts the fit and validation frame embeddings once in batches
-(`--feature-batch-size`, default 16) and caches them as float32 in CPU memory.
-On an RTX 4090, the frozen forward pass uses bfloat16 autocast. One
+The GRU trainer memory-maps the saved features. Its only data input is
+`embeddings.pt`. On an RTX 4090 the extractor uses bfloat16 autocast and saves
+float32 embeddings. One
 optimizer fits the GRU and similarity head with class-balanced binary
 cross-entropy. Recurrent samples retain their complete source prefixes.
 `--tbptt-chunk` detaches gradients between chunks while preserving history.
 
 Validation episodes select the best checkpoint, and test episodes remain
 reserved. The run writes `classifier.pt` and `classifier.metrics.json`.
-The version 2 checkpoint records the split, threshold, trainable weights,
-backbone identity and fingerprint. Loading it requires the original backbone
-in the Hugging Face cache, on the Hub or at the recorded local snapshot path.
-Each experiment can read the same raw trajectory archive.
+The DINOv3 GRU checkpoint records the split, threshold, trainable weights,
+backbone identity, and hashes of the original archive and feature file. Pixel
+inference (for example, a live Atari rollout) also needs the frozen backbone.
+Repeated GRU fits and anchor export with `--features` only use the saved vectors
+for model inference.
 
 ## Export the merged anchor set
 
@@ -140,12 +150,14 @@ MontezumaRevenge archive. For experiments that fit all 100k interactions, add
 ```bash
 python variants-supervised-agent/export_anchor_set.py \
   --archive logdir/montezuma_100k_0/episodes.pkl \
+  --features logdir/montezuma_100k_0/embeddings.pt \
   --classifier logdir/montezuma_100k_0/gru-run1/classifier.pt \
   --output logdir/montezuma_100k_0/gru-run1/anchor_set --device cuda:0
 ```
 
-The exporter restores the checkpoint, verifies its archive fingerprint, and
-processes every trajectory in collection order. This includes held-out episodes
+The exporter verifies the source files against the checkpoint, scores the saved
+vectors, and copies selected frames from the RGB archive into PNGs. Omitting
+`--features` computes the vectors from RGB during export. It processes every trajectory in collection order. This includes held-out episodes
 when the classifier used a split, and the final recorded prefix if collection
 ended during a game. Use `--complete-only` to restrict the export to completed
 episodes, as in the online return cycle.
@@ -229,7 +241,7 @@ python train_supervised_agent.py train \
 
 This architecture writes version 2 policy checkpoints. Earlier checkpoints with
 explicit progress inputs cannot be resumed or evaluated by this variant; train a
-new policy in a fresh output directory. The loader also supports version 1 classifier checkpoints.
+new policy in a fresh output directory.
 
 `--updates` is the total target, including resumed updates. Keep the same model,
 batch, unroll, and optimizer settings. New runs draw optimizer randomness from
@@ -274,8 +286,12 @@ the paths below with your archive and model locations. The integrated trainer
 passes episode arrays directly and does not use these archive-loading commands:
 
 ```bash
-python train_gru_classifier.py \
+python extract_dino_features.py \
   --archive /path/to/source/episodes.pkl \
+  --output /path/to/source/embeddings.pt --device cuda:0
+
+python train_gru_classifier.py \
+  --features /path/to/source/embeddings.pt \
   --output /path/to/new_round/classifier.pt \
   --all-data --device cuda:0
 
@@ -398,9 +414,7 @@ target anchor PNGs. Poor imitation fit is a reason to improve training before
 spending compute on these rollouts. Temporal similarity remains a learned proxy
 for accomplishment; the saved videos support visual inspection.
 
-Classifier training requires PyTorch, NumPy, Transformers and the DINOv3 weights. The second module also uses Pillow;
-environment evaluation uses Gymnasium and ALE, and video output uses OpenCV.
-The existing `r2dreamer` environment provides these packages. Use `--help` on
-either module or either agent subcommand for all arguments. These two modules
-produce their own portable checkpoint format; use the classifier checkpoint
-from step 1 with the agent in step 2.
+GRU training from a feature file requires PyTorch and NumPy. RGB feature extraction
+requires Transformers and the DINOv3 weights. Anchor PNG export uses Pillow.
+Environment evaluation uses Gymnasium and ALE, and video output uses OpenCV.
+Use `--help` on each script for its inputs and options.

@@ -6,22 +6,21 @@ import sys
 import numpy as np
 import pytest
 import torch
-from torch import nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'variants-supervised-agent'))
-from train_gru_classifier import FramePairGRU, PairSampler, sampled_embeddings
+from train_gru_classifier import RecurrentClassifier, PairSampler, sampled_embeddings
 
 
 @pytest.mark.parametrize('chunk_size', [0, 3])
 def test_packed_contexts_match_episode_unrolls(chunk_size):
     torch.manual_seed(321)
-    model = FramePairGRU(nn.Identity(), 7, 3, 5, 2)
-    sequences = [torch.randn(n, 7) for n in [2, 8, 21, 8]]
+    model = RecurrentClassifier(backbone='test', backbone_sha256='0' * 64, hidden_dim=5, num_layers=2)
+    sequences = [torch.randn(n, 1024) for n in [2, 8, 21, 8]]
     sampler = PairSampler(sequences)
     # Repeated positions, tied lengths and an endpoint in a partial last chunk.
     indices = [38, 0, 2, 8, 16, 8, 1, 27, 33]
     packed = sampled_embeddings(model, sequences, sampler, indices, 'cpu', chunk_size)
-    params = list(model.gru.parameters()) + list(model.projection.parameters())
+    params = list(model.gru.parameters())
     gradients = torch.autograd.grad(packed.square().sum(), params)
 
     episodes, positions = sampler.locate(np.asarray(indices))

@@ -79,16 +79,11 @@ def verify(run_dir, expected_rounds=2, allow_short_training=False):
     auxiliary = config['return_exploration']
     require(auxiliary['enabled'] and auxiliary['episodes'] == 100, 'Expected 100 assisted episodes per cycle')
     require(auxiliary['initial_policy'] is None, 'First cycle must train the default new return policy')
-    classifier_settings = auxiliary['classifier']
-    stages = ('visual', 'gru') if 'visual_steps' in classifier_settings else ('gru',)
-    expected_encoder = (dict(architecture='resnet18') if 'visual' in stages else
-                        dict(backbone='facebook/dinov3-vitl16-pretrain-lvd1689m'))
-    for name, value in dict(**expected_encoder, window=20, batch_size=64).items():
+    for name, value in dict(backbone='facebook/dinov3-vitl16-pretrain-lvd1689m', window=20, batch_size=64).items():
         require(auxiliary['classifier'][name] == value, f'Classifier override is not production: {name}')
     for name, value in dict(batch_size=4, unroll_length=2048).items():
         require(auxiliary['policy'][name] == value, f'Policy override is not production: {name}')
-    counts = [('classifier', f'{stage}_steps', 5000) for stage in stages]
-    for section, name, value in [*counts, ('policy', 'updates', 10000)]:
+    for section, name, value in [('classifier', 'gru_steps', 5000), ('policy', 'updates', 10000)]:
         actual = auxiliary[section][name]
         require(isinstance(actual, int) and actual > 0, f'Invalid training count: {section}.{name}')
         require(allow_short_training or actual == value,
@@ -158,16 +153,13 @@ def verify(run_dir, expected_rounds=2, allow_short_training=False):
         require(set(classifier_metrics['training_episode_ids']) == source_ids,
                 f'{label}: classifier omitted source episodes')
         require(classifier_metrics['evaluation_episode_ids'] == [], f'{label}: classifier reserved a holdout')
-        for stage in stages:
-            history = [row for row in classifier_metrics['history'] if row['stage'] == stage]
-            target = auxiliary['classifier'][f'{stage}_steps']
-            require(history and history[-1]['step'] == target,
-                    f'{label}: {stage} training did not reach {target} updates')
+        history = [row for row in classifier_metrics['history'] if row['stage'] == 'gru']
+        target = auxiliary['classifier']['gru_steps']
+        require(history and history[-1]['step'] == target,
+                f'{label}: GRU training did not reach {target} updates')
         require(str(classifier_metrics['train_config']['resolved_device']).startswith('cuda'),
                 f'{label}: classifier was not trained on CUDA')
         checkpoint_exists(directory / 'classifier.pt')
-        if 'visual' in stages:
-            checkpoint_exists(directory / 'classifier.visual.pt')
         classifier_hash = sha256(directory / 'classifier.pt')
         require(classifier_hash not in classifier_hashes, f'{label}: classifier checkpoint reused from a prior cycle')
         classifier_hashes.append(classifier_hash)
@@ -290,7 +282,7 @@ def verify_memory_run(root, config, expected_rounds, events, printed, updates, *
     trajectory_files = sorted(path.relative_to(root).as_posix() for path in root.rglob('*')
                               if path.is_file() and path.suffix in ('.pkl', '.npz'))
     require(not trajectory_files, f'Trajectory files remain on disk: {trajectory_files}')
-    forbidden = {'anchors.initial.json', 'counts.json', 'dreamer.pt', 'classifier.visual.pt'}
+    forbidden = {'anchors.initial.json', 'counts.json', 'dreamer.pt'}
     require(not any(path.name in forbidden for path in exploration.rglob('*')),
             'Historical anchor dumps or redundant checkpoints remain')
     expected_models = {root / 'latest.pt', directory / 'classifier.pt',
@@ -421,11 +413,10 @@ def verify_memory_run(root, config, expected_rounds, events, printed, updates, *
     require(classifier_metrics['evaluation_episode_ids'] == [], 'Latest classifier reserved a holdout')
     require(classifier_metrics['archive_sha256'] == report['source_sha256'],
             'Latest classifier used another source set')
-    for stage in (('visual', 'gru') if 'visual_steps' in auxiliary['classifier'] else ('gru',)):
-        history = [row for row in classifier_metrics['history'] if row['stage'] == stage]
-        target = auxiliary['classifier'][f'{stage}_steps']
-        require(history and history[-1]['step'] == target,
-                f'Latest classifier {stage} training did not reach {target} updates')
+    history = [row for row in classifier_metrics['history'] if row['stage'] == 'gru']
+    target = auxiliary['classifier']['gru_steps']
+    require(history and history[-1]['step'] == target,
+            f'Latest classifier GRU training did not reach {target} updates')
     require(str(classifier_metrics['train_config']['resolved_device']).startswith('cuda'),
             'Latest classifier was not trained on CUDA')
     require(sha256(directory / 'classifier.pt') == report['classifier_sha256'],
