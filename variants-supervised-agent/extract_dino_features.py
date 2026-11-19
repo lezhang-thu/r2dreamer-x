@@ -18,6 +18,15 @@ FEATURE_DIM = 1024
 PREPROCESSING = "symmetric_black_pad16_imagenet"
 
 
+def load_timm_checkpoint(path):
+    import timm
+
+    weights = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+    model = timm.create_model("vit_large_patch16_dinov3", pretrained=False, num_classes=0, global_pool="token")
+    model.load_state_dict(weights, strict=True)
+    return model
+
+
 def load_dino_backbone(source, revision=None):
     from transformers import AutoModel
 
@@ -29,13 +38,22 @@ class DinoFrameEncoder(nn.Module):
 
     def __init__(self, backbone=DEFAULT_BACKBONE, revision=None):
         super().__init__()
-        self.backbone = str(Path(backbone).resolve()) if Path(backbone).is_dir() else str(backbone)
-        self.model = load_dino_backbone(self.backbone, revision=revision)
-        config = self.model.config
-        if (config.model_type, config.patch_size, config.hidden_size, config.num_hidden_layers) != (
-                "dinov3_vit", 16, FEATURE_DIM, 24):
-            raise ValueError("--backbone must be a pretrained DINOv3 ViT-L/16 model")
-        self.revision = getattr(config, "_commit_hash", None) or revision
+        path = Path(backbone).expanduser()
+        self.timm_checkpoint = path.suffix.lower() == ".pth" and not path.is_dir()
+        if self.timm_checkpoint:
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            self.backbone = str(path.resolve())
+            self.model = load_timm_checkpoint(self.backbone)
+            self.revision = None
+        else:
+            self.backbone = str(path.resolve()) if path.is_dir() else str(backbone)
+            self.model = load_dino_backbone(self.backbone, revision=revision)
+            config = self.model.config
+            if (config.model_type, config.patch_size, config.hidden_size, config.num_hidden_layers) != (
+                    "dinov3_vit", 16, FEATURE_DIM, 24):
+                raise ValueError("--backbone must be a pretrained DINOv3 ViT-L/16 model")
+            self.revision = getattr(config, "_commit_hash", None) or revision
         self.backbone_sha256 = state_digest(hashlib.sha256(), self.model.state_dict()).hexdigest()
         self.register_buffer("rgb_mean", torch.tensor([.485, .456, .406]).view(1, 3, 1, 1), persistent=False)
         self.register_buffer("rgb_std", torch.tensor([.229, .224, .225]).view(1, 3, 1, 1), persistent=False)
@@ -53,7 +71,7 @@ class DinoFrameEncoder(nn.Module):
         pixels = (padded - self.rgb_mean) / self.rgb_std
         use_bfloat16 = pixels.is_cuda and torch.cuda.get_device_capability(pixels.device)[0] >= 8
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_bfloat16):
-            cls = self.model(pixel_values=pixels).pooler_output
+            cls = self.model(pixels) if self.timm_checkpoint else self.model(pixel_values=pixels).pooler_output
         return cls.float()
 
 
@@ -106,7 +124,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--archive", type=Path, required=True, help="Source episodes.pkl")
     parser.add_argument("--output", type=Path, required=True, help="New embeddings.pt file")
-    parser.add_argument("--backbone", default=DEFAULT_BACKBONE, help="Hugging Face ID or local ViT-L/16 snapshot")
+    parser.add_argument("--backbone", default=DEFAULT_BACKBONE, help="Hugging Face ID, local snapshot, or timm ViT-L/16 .pth file")
     parser.add_argument("--feature-batch-size", type=int, default=16, help="Frames per frozen DINO forward pass")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args(argv)

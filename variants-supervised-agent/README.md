@@ -111,7 +111,10 @@ python variants-supervised-agent/train_gru_classifier.py \
 
 The frozen backbone is Meta's [DINOv3 ViT-L/16](https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m).
 Authenticate with an account that has access to the weights, or supply a local
-Hugging Face snapshot directory to the extractor through `--backbone`. A native 210×160 screen
+Hugging Face snapshot directory to the extractor through `--backbone`. For the
+[Kaggle weights](https://www.kaggle.com/datasets/ozanize/dinov3-vitl16-weights),
+pass the extracted file directly with `--backbone /path/to/dinov3_vitl16.pth`.
+This loads a local timm ViT-L/16 with CLS-token pooling. A native 210×160 screen
 gets seven black rows above and below and ImageNet channel normalization. The
 resulting 224×160 image has a 14×10 patch grid. The classifier takes one
 1,024-dimensional final CLS vector per frame and feeds it directly to a causal
@@ -415,6 +418,6 @@ spending compute on these rollouts. Temporal similarity remains a learned proxy
 for accomplishment; the saved videos support visual inspection.
 
 GRU training from a feature file requires PyTorch and NumPy. RGB feature extraction
-requires Transformers and the DINOv3 weights. Anchor PNG export uses Pillow.
+uses Transformers for Hugging Face snapshots or timm for the Kaggle checkpoint. Anchor PNG export uses Pillow.
 Environment evaluation uses Gymnasium and ALE, and video output uses OpenCV.
 Use `--help` on each script for its inputs and options.

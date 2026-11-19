@@ -10,7 +10,7 @@ conda activate r2dreamer
 python -m pip install --upgrade pip setuptools wheel
 ```
 
-Use the [official PyTorch installation selector](https://pytorch.org/get-started/locally/) to select **Stable**, your OS, **Pip**, **Python**, and a CUDA build supported by your GPU and driver. Run its installation command inside this Conda environment. Only `torch` is needed here; `torchvision` and `torchaudio` are not used.
+Use the [official PyTorch installation selector](https://pytorch.org/get-started/locally/) to select **Stable**, your OS, **Pip**, **Python**, and a CUDA build supported by your GPU and driver. Run its installation command inside this Conda environment. Install matching `torch` and `torchvision` builds for the timm feature extractor.
 
 Then install the remaining requirements:
 
@@ -73,7 +73,8 @@ python variants-supervised-agent/extract_dino_features.py \
 
 The extraction step needs access to the [DINOv3 ViT-L/16 pretrained weights](https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m).
 Authenticate on the training machine or point the extractor's `--backbone` at
-a local Hugging Face snapshot.
+a local Hugging Face snapshot. With the [Kaggle timm weights](https://www.kaggle.com/datasets/ozanize/dinov3-vitl16-weights),
+pass `--backbone /path/to/dinov3_vitl16.pth` to the extractor.
 
 To fit the GRU on all collected trajectories, pass `--all-data`. Use a fresh
 classifier output path for each experiment and reuse `embeddings.pt`.

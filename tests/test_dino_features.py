@@ -2,6 +2,7 @@
 from pathlib import Path
 import pickle
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -52,3 +53,27 @@ def test_loader_rejects_wrong_width_and_duplicate_ids(tmp_path):
         torch.save(dict(data, episodes=records), path)
         with pytest.raises(ValueError, match="unique integer ID"):
             extractor.load_features(path)
+
+
+def test_local_timm_checkpoint_loads_cls_for_native_frames(tmp_path, monkeypatch):
+    class TokenModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.cls = torch.nn.Parameter(torch.zeros(1, 1024))
+
+        def forward(self, pixels):
+            assert pixels.shape == (2, 3, 224, 160)
+            return self.cls.expand(len(pixels), -1)
+
+    def create_model(name, *, pretrained, num_classes, global_pool):
+        assert name == "vit_large_patch16_dinov3" and not pretrained
+        assert num_classes == 0 and global_pool == "token"
+        return TokenModel()
+
+    monkeypatch.setitem(sys.modules, "timm", SimpleNamespace(create_model=create_model))
+    monkeypatch.chdir(tmp_path)
+    weights = torch.arange(1024, dtype=torch.float32).reshape(1, 1024)
+    torch.save({"cls": weights}, "dinov3_vitl16.pth")
+    encoder = extractor.DinoFrameEncoder("dinov3_vitl16.pth")
+    assert encoder.backbone == str((tmp_path / "dinov3_vitl16.pth").resolve())
+    torch.testing.assert_close(encoder(torch.zeros(2, 3, 210, 160)), weights.expand(2, -1))
