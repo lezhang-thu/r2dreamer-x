@@ -131,6 +131,40 @@ backbone identity and fingerprint. Loading it requires the original backbone
 in the Hugging Face cache, on the Hub or at the recorded local snapshot path.
 Each experiment can read the same raw trajectory archive.
 
+## Export the merged anchor set
+
+From the repository root, run this after fitting the classifier on the native
+MontezumaRevenge archive. For experiments that fit all 100k interactions, add
+`--all-data` to the classifier **training** command above.
+
+```bash
+python variants-supervised-agent/export_anchor_set.py \
+  --archive logdir/montezuma_100k_0/episodes.pkl \
+  --classifier logdir/montezuma_100k_0/gru-run1/classifier.pt \
+  --output logdir/montezuma_100k_0/gru-run1/anchor_set --device cuda:0
+```
+
+The exporter restores the checkpoint, verifies its archive fingerprint, and
+processes every trajectory in collection order. This includes held-out episodes
+when the classifier used a split, and the final recorded prefix if collection
+ended during a game. Use `--complete-only` to restrict the export to completed
+episodes, as in the online return cycle.
+
+Within each trajectory, the GRU starts at reset. Frame zero is the initial
+reference. The first later frame with similarity below the checkpoint threshold
+becomes an anchor and the next reference. Across trajectories, the exporter
+applies the same representative selection as the online anchor bank. A candidate
+increments the count of every existing representative it matches at or above
+the threshold. A candidate with zero matches becomes a new representative.
+Both comparisons use the learned similarity head on the GRU contexts.
+
+Open the output directory to inspect one lossless 160-pixel-wide by
+210-pixel-high PNG per representative, numbered in selection order. The image
+comes directly from the source frame. The manifest records the threshold,
+candidate and representative counts, and each PNG's source episode, frame index,
+anchor position and count. An empty set produces a manifest with zero
+representatives. Use a fresh output directory for each classifier checkpoint.
+
 ## Step 2: train the supervised agent
 
 The remaining examples use paths relative to this directory and the existing

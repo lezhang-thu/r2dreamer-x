@@ -61,13 +61,13 @@ Allow roughly 10.1 GB for the archive and additional space for the Dreamer
 checkpoint and logs. The writer builds the final archive in place under a
 temporary name and publishes it when collection finishes.
 
-Train the GRU on the same file with different options and a fresh output path for each experiment.
+To fit the GRU on all collected trajectories, pass `--all-data`. Use a fresh output path for each experiment.
 
 ```bash
 python variants-supervised-agent/train_gru_classifier.py \
   --archive logdir/montezuma_100k_0/episodes.pkl \
   --output logdir/montezuma_100k_0/gru-run1/classifier.pt \
-  --seed 0 --device cuda:0
+  --all-data --seed 0 --device cuda:0
 ```
 
 The classifier needs access to the [DINOv3 ViT-L/16 pretrained weights](https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m).
@@ -75,16 +75,30 @@ Accept the model terms and authenticate on the training machine, or supply
 `--backbone /path/to/local/huggingface-snapshot`. See the
 [classifier guide](variants-supervised-agent/README.md) for splits and preprocessing.
 
+After training, export the merged anchor set for visual inspection.
+
+```bash
+python variants-supervised-agent/export_anchor_set.py \
+  --archive logdir/montezuma_100k_0/episodes.pkl \
+  --classifier logdir/montezuma_100k_0/gru-run1/classifier.pt \
+  --output logdir/montezuma_100k_0/gru-run1/anchor_set --device cuda:0
+```
+
+The output contains one native-resolution RGB PNG per representative. Its
+`manifest.json` maps each image back to its episode and frame number. By
+default, every collected trajectory contributes, including a final cutoff
+prefix. Pass `--complete-only` to apply the online cycle's source-selection rule.
+
 ## Run training
 
-The default configuration now runs MontezumaRevenge with periodic return
+The `atari_return` configuration currently runs H.E.R.O. with periodic return
 exploration, **50 million ordinary environment interactions** (200 million
 action-repeat frames), and a replay capacity of **1 million stored transitions**.
-Launch the 100M model from the repository root:
+To run the 100M model on MontezumaRevenge, set the task explicitly:
 
 ```bash
 conda activate r2dreamer
-bash runs/montezuma_return.sh
+bash runs/montezuma_return.sh env.task=atari_montezuma_revenge
 ```
 
 `GPU_ID`, `SEED`, and `RUN_DIR` can be supplied as environment variables. Extra

@@ -23,7 +23,7 @@ import torch
 from tensordict import TensorDict
 
 from episode_archive import EpisodeArchive, EpisodeRecorder, resize_frame
-from return_anchors import AnchorBank
+from return_anchors import AnchorBank, classifier_similarity
 
 
 VARIANT = Path(__file__).resolve().parent / 'variants-supervised-agent'
@@ -264,14 +264,7 @@ class ReturnExploration:
                 self.policy_state.optimizer.zero_grad(set_to_none=True)
                 self.policy_state.to('cpu')
 
-        @torch.no_grad()
-        def similarity(left, right):
-            a = torch.as_tensor(np.array(left, copy=True), device=self.device)
-            b = torch.as_tensor(np.array(right, copy=True), device=self.device)
-            a = a[:, None].expand(-1, len(b), -1).reshape(-1, a.shape[-1])
-            b = b[None].expand(len(left), -1, -1).reshape(-1, b.shape[-1])
-            return classifier.pair_logits(a, b).sigmoid().reshape(len(left), len(right)).cpu().numpy()
-
+        similarity = classifier_similarity(classifier, self.device)
         bank = AnchorBank.build(demos, similarity, checkpoint['threshold'])
         # Only goal images and lookup indices are needed for the 100 rollouts.
         goals_by_id = {demo['id']: demo['goals'] for demo in demos}

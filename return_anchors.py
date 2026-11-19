@@ -10,6 +10,21 @@ or source prefixes to the current round.
 import numpy as np
 
 
+def classifier_similarity(classifier, device):
+    """Make the GRU pair-head probability callback for two sets of contexts."""
+    import torch
+
+    @torch.no_grad()
+    def similarity(left, right):
+        a = torch.as_tensor(np.array(left, copy=True), device=device)
+        b = torch.as_tensor(np.array(right, copy=True), device=device)
+        a = a[:, None].expand(-1, len(b), -1).reshape(-1, a.shape[-1])
+        b = b[None].expand(len(left), -1, -1).reshape(-1, b.shape[-1])
+        return classifier.pair_logits(a, b).sigmoid().reshape(len(left), len(right)).cpu().numpy()
+
+    return similarity
+
+
 class AnchorBank:
     def __init__(self, references, counts, prefixes, origins, similarity,
                  threshold=0.5, chunk_size=256):
@@ -61,17 +76,18 @@ class AnchorBank:
         return probabilities >= threshold
 
     @classmethod
-    def build(cls, demos, similarity, threshold=0.5, chunk_size=256):
-        """Build A/counters in order, then index prefixes against the final A.
+    def select_representatives(cls, demos, similarity, threshold=0.5, chunk_size=256):
+        """Return representative contexts, counts and (episode ID, anchor position) origins.
 
-        Each demo provides an integer ``id`` and a ``references`` array in
-        anchor order. A prefix reference is ``(episode_id, anchor_position)``;
-        the associated goal sequence includes that position.
+        Process demos in source order. A match increments every matching representative.
+        The first occurrence with no matches becomes a new representative.
         """
         threshold, chunk_size = float(threshold), int(chunk_size)
         if not 0 <= threshold <= 1 or chunk_size < 1:
             raise ValueError('Invalid anchor similarity threshold or chunk size')
-        sources, seen, dimension = [], set(), None
+        seen = set()
+        dimension, dtype = None, np.float32
+        representatives, counts, origins = [], [], []
         for demo in demos:
             episode_id = int(demo['id'])
             if episode_id in seen:
@@ -80,11 +96,7 @@ class AnchorBank:
             refs = cls._references(demo['references'])
             if dimension is not None and refs.shape[1] != dimension:
                 raise ValueError('Source anchor embedding dimensions differ')
-            dimension = refs.shape[1]
-            sources.append((episode_id, refs))
-
-        representatives, counts, origins = [], [], []
-        for episode_id, refs in sources:
+            dimension, dtype = refs.shape[1], refs.dtype
             for position, reference in enumerate(refs):
                 found = False
                 for start in range(0, len(representatives), chunk_size):
@@ -97,15 +109,25 @@ class AnchorBank:
                     representatives.append(reference.copy())
                     counts.append(1)
                     origins.append((episode_id, position))
-        if not representatives:
+        references = np.stack(representatives) if representatives else np.empty((0, dimension or 0), dtype=dtype)
+        return references, np.asarray(counts, dtype=np.int64), tuple(origins)
+
+    @classmethod
+    def build(cls, demos, similarity, threshold=0.5, chunk_size=256):
+        """Select representatives, then index source prefixes against that final set."""
+        # Only the online bank needs to revisit all source contexts for prefix lookup.
+        demos = [dict(id=int(demo['id']), references=np.asarray(demo['references'])) for demo in demos]
+        threshold, chunk_size = float(threshold), int(chunk_size)
+        references, counts, origins = cls.select_representatives(demos, similarity, threshold, chunk_size)
+        if not len(references):
             raise ValueError('No anchors available for return exploration')
 
-        references = np.stack(representatives)
-        prefixes = [[] for _ in representatives]
+        prefixes = [[] for _ in references]
         origin_indices = {origin: index for index, origin in enumerate(origins)}
         # A representative added late can match an earlier nonrepresentative
         # occurrence. A second pass is essential when similarity is nontransitive.
-        for episode_id, refs in sources:
+        for demo in demos:
+            episode_id, refs = demo['id'], demo['references']
             for start in range(0, len(refs), chunk_size):
                 left = refs[start:start + chunk_size]
                 for target_start in range(0, len(references), chunk_size):
