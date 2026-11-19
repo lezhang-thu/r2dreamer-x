@@ -40,6 +40,41 @@ env.close()
 PYTHON
 ```
 
+## Collect 100k MontezumaRevenge interactions for the GRU
+
+From the repository root, run the collector once on the training machine.
+
+```bash
+RUN_DIR=logdir/montezuma_100k_0 bash runs/collect_montezuma_100k.sh
+```
+
+This trains the 100M R2-Dreamer agent for 100,000 action decisions in one environment.
+At action repeat 4 this is a budget of 400,000 repeated frames. The archive records
+the native `210 × 160 × 3` uint8 ALE screen after reset and after each decision.
+Dreamer receives its usual pooled 64×64 input. The final action and observation
+are included even when the budget ends midway through a game.
+
+The reusable, uncompressed file is `logdir/montezuma_100k_0/episodes.pkl`. For
+`E` recorded trajectories, the pixels occupy `100800 × (100000 + E)` bytes,
+plus about 1.4 MB for actions, rewards and end flags and a small episode index.
+Allow roughly 10.1 GB for the archive and additional space for the Dreamer
+checkpoint and logs. The writer builds the final archive in place under a
+temporary name and publishes it when collection finishes.
+
+Train the GRU on the same file with different options and a fresh output path for each experiment.
+
+```bash
+python variants-supervised-agent/train_gru_classifier.py \
+  --archive logdir/montezuma_100k_0/episodes.pkl \
+  --output logdir/montezuma_100k_0/gru-run1/classifier.pt \
+  --seed 0 --device cuda:0
+```
+
+The classifier needs access to the [DINOv3 ViT-L/16 pretrained weights](https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m).
+Accept the model terms and authenticate on the training machine, or supply
+`--backbone /path/to/local/huggingface-snapshot`. See the
+[classifier guide](variants-supervised-agent/README.md) for splits and preprocessing.
+
 ## Run training
 
 The default configuration now runs MontezumaRevenge with periodic return
@@ -66,10 +101,9 @@ Every 100,000 **ordinary** interactions, learning pauses for one return phase:
    phase this includes its 100 assisted episodes and newly completed ordinary
    episodes. An unfinished ordinary episode stays alive and is included only
    in a later source set after it ends.
-2. Fit a fresh classifier on all source episodes: ResNet-18, 5,000 visual
-   updates, 5,000 GRU updates, temporal window 20. Unlike standalone evaluation,
-   this mode has no held-out episodes; checkpoint-selection diagnostics use
-   training episodes.
+2. Extract frozen DINOv3 ViT-L/16 CLS embeddings from the cycle's RGB84 frames.
+   Fit the GRU classifier for 5,000 updates with temporal window 20.
+   Checkpoint-selection diagnostics use all source episodes.
 3. Train the return policy for 10,000 additional updates, batch size 4, unroll
    length 2,048. Later phases continue with the same policy parameters
    **and AdamW optimizer state in memory**. The first phase initializes a new policy unless

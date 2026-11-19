@@ -1,10 +1,20 @@
 from . import parallel, wrappers
 
 
-def make_envs(config):
+def make_envs(config, archive_path=None):
     """Construct training workers only; periodic evaluation is disabled."""
+    if archive_path is not None and config.env_num != 1:
+        raise ValueError("Saving the native trajectory archive requires env.env_num=1")
+
     def env_constructor(idx):
-        return lambda: make_env(config, idx)
+        def construct():
+            env = make_env(config, idx)
+            if archive_path is not None:
+                from omegaconf import OmegaConf
+                from .native_archive import NativeEpisodeArchive
+                return NativeEpisodeArchive(env, archive_path, OmegaConf.to_container(config, resolve=True))
+            return env
+        return construct
 
     train_envs = parallel.ParallelEnv(env_constructor, config.env_num, config.device)
     # Preserve the caller's return signature without allocating idle evaluation

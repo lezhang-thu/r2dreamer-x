@@ -1,7 +1,6 @@
 """Train/evaluate supervised anchor-conditioned BC using a trajectory pickle.
 
-The only local dependency is the sibling train_gru_classifier.py. Training is
-offline cross-entropy; evaluation uses independent Atari starts and a frozen
+Training uses offline cross-entropy. Evaluation uses independent Atari starts and a frozen
 classifier, similarity-based anchor LCS, and complete environment episodes.
 """
 
@@ -23,9 +22,9 @@ from torch.nn import functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence, pad_sequence
 from torch.utils.checkpoint import checkpoint as recompute
 
+from legacy_classifier import make_encoder
 from train_gru_classifier import (copy_model_state, encode_trajectory, file_sha256, frames_to_tensor,
-                                  load_archive, load_classifier, make_encoder,
-                                  model_fingerprint)
+                                  load_archive, load_classifier, model_fingerprint)
 
 
 def require(condition, message):
@@ -74,7 +73,7 @@ def prepare_demonstrations(episodes, ids, classifier, threshold, device='cpu', s
         frames, actions = source['frames'], source.get('actions')
         require(actions is not None and len(actions) == len(frames) - 1,
                 f'Episode {episode_id}: supervised cloning requires recorded aligned actions')
-        contexts = encode_trajectory(classifier, frames, device=device, batch_size=1).to(device)
+        contexts = encode_trajectory(classifier, frames, device=device, batch_size=16).to(device)
         indices = extract_anchor_indices(classifier, contexts, threshold)
         # No synthetic terminal anchor is inserted to hide a degenerate classifier.
         if not indices and skip_empty:
@@ -117,8 +116,8 @@ class GoalPolicy(nn.Module):
     def encode_images(self, frames):
         """Chunk visual work, avoiding an episode-sized float RGB GPU allocation."""
         raw = torch.as_tensor(np.asarray(frames))
-        require(raw.dtype == torch.uint8 and raw.ndim == 4 and tuple(raw.shape[1:]) == (84, 84, 3),
-                'Policy observations must be uint8 RGB84')
+        require(raw.dtype == torch.uint8 and raw.ndim == 4 and raw.shape[-1] == 3
+                and min(raw.shape[1:3]) > 0, 'Policy observations must be uint8 RGB images')
         if not len(raw):
             return self.actor.weight.new_empty((0, self.hidden_dim))
 
@@ -133,8 +132,7 @@ class GoalPolicy(nn.Module):
     def encode_goals(self, goals):
         lengths = torch.tensor([len(g) for g in goals], device=self.device)
         require(bool((lengths > 0).all()), 'Every task needs at least one anchor')
-        features = self.encode_images(np.concatenate(goals))
-        features = pad_sequence(list(features.split(lengths.tolist())), batch_first=True)
+        features = pad_sequence([self.encode_images(frames) for frames in goals], batch_first=True)
         packed = pack_padded_sequence(features, lengths.cpu(), batch_first=True, enforce_sorted=False)
         memory, _ = self.anchor_gru(packed)
         memory, _ = pad_packed_sequence(memory, batch_first=True, total_length=features.shape[1])
@@ -186,11 +184,7 @@ def segment_logits(policy, demos, segments):
     memory, lengths = policy.encode_goals([d['goals'] for d in selected])
 
     def features_for(spans):
-        counts = [len(span) for span in spans]
-        if not sum(counts):
-            return policy.actor.weight.new_empty((len(spans), 0, policy.hidden_dim))
-        encoded = policy.encode_images(np.concatenate(spans))
-        return pad_sequence(list(encoded.split(counts)), batch_first=True)
+        return pad_sequence([policy.encode_images(span) for span in spans], batch_first=True)
 
     with torch.no_grad():
         prefixes = features_for([d['frames'][:start] for d, start in zip(selected, starts)])
@@ -477,7 +471,10 @@ class AtariEnv:
         self.action_meanings = self.env.unwrapped.get_action_meanings()
         self.num_actions = self.env.action_space.n
         self.ale = self.env.unwrapped.ale
-        self.buffers = collections.deque([np.zeros_like(self.ale.getScreenRGB()) for _ in range(pooling)], maxlen=pooling)
+        self.native_rgb = config.get('archive_frame_source') == 'ale_rgb'
+        if not self.native_rgb:
+            self.buffers = collections.deque([np.zeros_like(self.ale.getScreenRGB())
+                                              for _ in range(pooling)], maxlen=pooling)
         self.steps = 0
 
     def _render(self):
@@ -485,6 +482,8 @@ class AtariEnv:
         self.ale.getScreenRGB(self.buffers[0])
 
     def _image(self):
+        if self.native_rgb:
+            return self.ale.getScreenRGB()
         image = (np.amax(self.buffers, 0) if self.config.get('aggregate', 'max') == 'max'
                  else np.mean(self.buffers, 0).astype(np.uint8))
         if image.shape[:2] != self.size:
@@ -513,9 +512,10 @@ class AtariEnv:
                     _, _, terminated, truncated, _ = self.env.step(self.action_meanings.index(name))
                     if terminated or truncated:
                         self.env.reset()
-        self._render()
-        for i in range(1, len(self.buffers)):
-            np.copyto(self.buffers[i], self.buffers[0])
+        if not self.native_rgb:
+            self._render()
+            for i in range(1, len(self.buffers)):
+                np.copyto(self.buffers[i], self.buffers[0])
         self.steps = 0
         return self._image()
 
@@ -527,7 +527,7 @@ class AtariEnv:
             _, value, terminal, truncation, _ = self.env.step(int(action))
             self.steps += 1
             reward += float(value)
-            if repeat >= self.repeat - len(self.buffers):
+            if not self.native_rgb and repeat >= self.repeat - len(self.buffers):
                 self._render()
             terminated |= bool(terminal)
             truncated |= bool(truncation or self.steps >= self.limit)
@@ -539,10 +539,11 @@ class AtariEnv:
         self.env.close()
 
 
-def video_writer(path, fps):
+def video_writer(path, fps, frame_shape):
     import cv2
-    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*'mp4v'), fps, (84, 84))
-    require(writer.isOpened(), 'Could not create RGB84 video')
+    height, width = frame_shape[:2]
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
+    require(writer.isOpened(), 'Could not create RGB video')
     return writer
 
 
@@ -585,7 +586,7 @@ def eval_one(policy, classifier, demo, env, seed, threshold, device, video_path=
     extraction_reference, classifier_hidden = classifier.encode_step(frames_to_tensor(frame[None], device), None)
     hidden, game_return = None, 0.
     actions, rollout_anchors, rollout_indices = [], [], []
-    writer = None if video_path is None else video_writer(video_path, 60 / env.repeat)
+    writer = None if video_path is None else video_writer(video_path, 60 / env.repeat, frame.shape)
     if writer is not None:
         writer.write(frame[..., ::-1])
     try:
@@ -701,7 +702,7 @@ def evaluate(args):
                 anchors.mkdir()
                 for k, frame in enumerate(demo['goals']):
                     Image.fromarray(frame).save(anchors / f'{k:04d}.png')
-                writer = video_writer(directory / 'source.mp4', 60 / env.repeat)
+                writer = video_writer(directory / 'source.mp4', 60 / env.repeat, demo['frames'].shape[1:])
                 try:
                     for frame in demo['frames']:
                         writer.write(frame[..., ::-1])
@@ -767,7 +768,7 @@ def parse_args(argv=None, *, require_inputs=True):
             sub.add_argument('--episodes', type=int, default=0, help='Latest N goals per split; 0 means all (default)')
             sub.add_argument('--repeats', type=int, default=1)
             sub.add_argument('--env-config', help='Explicit Atari preprocessing config as a JSON object, if absent in archive')
-            sub.add_argument('--save-videos', action='store_true', help='Save RGB84 source/rollout MP4s and separate anchor PNGs')
+            sub.add_argument('--save-videos', action='store_true', help='Save source/rollout MP4s and separate anchor PNGs')
     return parser.parse_args(argv)
 
 

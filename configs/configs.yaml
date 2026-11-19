@@ -9,6 +9,7 @@ logdir: logdir/${now:%Y-%m-%d}/${now:%H-%M-%S}
 seed: 0
 deterministic_run: False
 device: 'cuda:0'
+save_episodes: False
 
 hydra:
   run:
@@ -46,8 +47,8 @@ return_exploration:
   episodes: 100
   initial_policy: null
   classifier:
-    architecture: resnet18
-    visual_steps: 5000
+    backbone: facebook/dinov3-vitl16-pretrain-lvd1689m
+    feature_batch_size: 16
     gru_steps: 5000
     window: 20
     batch_size: 64

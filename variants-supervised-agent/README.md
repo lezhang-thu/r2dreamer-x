@@ -1,14 +1,13 @@
 # GRU classifier and supervised goal-conditioned agent
 
-This directory has exactly two Python modules and this guide:
+This directory has two training entry points.
 
 1. **`train_gru_classifier.py`** reads trajectories from a `.pkl`, trains the
    temporal similarity classifier, and saves its checkpoint.
 2. **`train_supervised_agent.py`** reads the same `.pkl` and that checkpoint,
    extracts anchors, trains a supervised policy, and evaluates it in Atari.
 
-The second module imports shared archive/model utilities from the first. Keep
-the two files together. They have no imports from the original project and do
+The second module imports shared archive/model utilities from the first. Keep the sibling Python modules together. They have no imports from the original project and do
 not require R2-Dreamer, its world model, A2C, SAC, or the augmentation experiments.
 
 ## Input: an existing trajectory pickle
@@ -32,17 +31,34 @@ cycle's 100 assisted episodes plus ordinary episodes completed since the
 previous source selection. Older source episodes are excluded.
 
 The standalone default train/validation/holdout split needs at least three
-completed episodes. The integrated cycle uses `--all-data`, described below,
+trajectories of at least two frames. The integrated cycle uses `--all-data`, described below,
 and can fit a nonempty source set without reserving episodes. See the repository
 README for the MontezumaRevenge launcher and return-exploration configuration.
 
-The existing H.E.R.O. archive works directly:
+The [MontezumaRevenge collector](../README.md#collect-100k-montezumarevenge-interactions-for-the-gru)
+writes uncompressed native screens to `logdir/montezuma_100k_0/episodes.pkl`.
+Use `load_archive(path)` in other experiments to get the episode dictionaries
+and metadata. The version 2 file starts with a pickled header, followed by the
+contiguous RGB pixels, a pickled episode index, and an eight-byte little-endian
+offset to the index. A single `pickle.load` reads only the header. The supplied
+reader maps the pixels read-only and exposes a NumPy array for each trajectory.
+For example, from this directory:
+
+```python
+from train_gru_classifier import load_archive
+
+episodes, metadata = load_archive("../logdir/montezuma_100k_0/episodes.pkl")
+assert sum(len(ep["actions"]) for ep in episodes) == 100_000
+print(episodes[0]["frames"].shape, metadata["action_meanings"])
+```
+
+The existing H.E.R.O. archive also works directly.
 
 ```text
 ../artifacts/hero/r2dreamer_sampled256/episodes.pkl
 ```
 
-The loader supports its `atari_episode_archive` format, including compressed
+The loader supports its version 1 `atari_episode_archive` format, including compressed
 `payload_npz` episode records. It also accepts a plain list of episode
 dictionaries, or `{"episodes": [...], "metadata": {...}}` with uncompressed
 arrays. Each episode contains:
@@ -50,10 +66,10 @@ arrays. Each episode contains:
 | Field | Meaning |
 |---|---|
 | `id` | Unique integer; defaults to its position in a plain list |
-| `frames` | `uint8` RGB array with shape `[N+1, 84, 84, 3]` |
+| `frames` | `uint8` RGB array with shape `[N+1, 210, 160, 3]` (native) or `[N+1, 84, 84, 3]` (legacy) |
 | `actions` | Integer array `[N]`; action `t` takes frame `t` to frame `t+1` |
 | `reset_seed` | Original reset seed, when available |
-| `complete` | Must be true if supplied |
+| `complete` | False with `collection_cutoff=True` for the final live prefix of a native run |
 
 The classifier needs frames only. Supervised action learning requires the
 recorded actions; it does not infer them from images. Optional rewards and end
@@ -74,21 +90,24 @@ object. The configuration must describe how the source images were produced.
 
 ## Step 1: train the GRU classifier
 
-From this directory, using the existing `r2dreamer` conda environment:
+From the repository root, after collecting the MontezumaRevenge archive, run
 
 ```bash
 conda activate r2dreamer
-python train_gru_classifier.py \
-  --archive ../artifacts/hero/r2dreamer_sampled256/episodes.pkl \
-  --output ../artifacts/minimal_pipeline/classifier.pt \
-  --architecture resnet18 --visual-steps 5000 --gru-steps 5000 \
-  --window 20 --device cuda:0
+python variants-supervised-agent/train_gru_classifier.py \
+  --archive logdir/montezuma_100k_0/episodes.pkl \
+  --output logdir/montezuma_100k_0/gru-run1/classifier.pt \
+  --gru-steps 5000 --window 20 --seed 0 --device cuda:0
 ```
 
-For episode frames `f[0], ..., f[T]`, a CNN produces visual features and a causal
-GRU produces contextual embeddings `z[t]`. Each embedding depends on the actual
-episode prefix through `t`. The symmetric similarity head receives
-`abs(z[i] - z[j])` and `z[i] * z[j]`, and predicts a binary similarity probability.
+The frozen backbone is Meta's [DINOv3 ViT-L/16](https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m).
+Authenticate with an account that has access to the weights, or supply a local
+Hugging Face snapshot directory through `--backbone`. A native 210×160 screen
+gets seven black rows above and below and ImageNet channel normalization. The
+resulting 224×160 image has a 14×10 patch grid. The classifier takes one
+1,024-dimensional final CLS vector per frame and feeds it directly to a causal
+GRU. Every context `z[t]` incorporates the episode prefix through frame `t`.
+The symmetric head scores `abs(z[i] - z[j])` and `z[i] * z[j]`.
 
 The temporal skip-gram labels are:
 
@@ -98,25 +117,24 @@ The temporal skip-gram labels are:
   frame positions independently and uniformly within it. Nearby pairs and
   identical positions are allowed. No far-away exclusion is applied.
 
-Both stages use binary cross-entropy, with equal positive/negative class weight.
-There are equal numbers of positives and negatives by default. No manually
-annotated goals, actions, rewards, or room labels train the classifier.
+Each run extracts the fit and validation frame embeddings once in batches
+(`--feature-batch-size`, default 16) and caches them as float32 in CPU memory.
+On an RTX 4090, the frozen forward pass uses bfloat16 autocast. One
+optimizer fits the GRU and similarity head with class-balanced binary
+cross-entropy. Recurrent samples retain their complete source prefixes.
+`--tbptt-chunk` detaches gradients between chunks while preserving history.
 
-The single command performs the same two-stage procedure as the previous code:
-
-1. Train a visual pair classifier, including the ResNet-18 encoder.
-2. Freeze the selected visual encoder, cache its features, and train the causal
-   GRU and similarity head. Recurrent samples retain their complete source
-   prefixes; `--tbptt-chunk` can detach gradients between chunks without resetting
-   history. The frozen CNN remains in evaluation mode.
-
-An internal validation split drawn only from the training episodes selects
-checkpoints. Held-out episodes are not used for either stage. The output is
-`classifier.pt`, with a visual-stage checkpoint `classifier.visual.pt` and
-training metrics `classifier.metrics.json` beside it. The checkpoint includes
-the archive hash, split, threshold, model settings, and weights.
+Validation episodes select the best checkpoint, and test episodes remain
+reserved. The run writes `classifier.pt` and `classifier.metrics.json`.
+The version 2 checkpoint records the split, threshold, trainable weights,
+backbone identity and fingerprint. Loading it requires the original backbone
+in the Hugging Face cache, on the Hub or at the recorded local snapshot path.
+Each experiment can read the same raw trajectory archive.
 
 ## Step 2: train the supervised agent
+
+The remaining examples use paths relative to this directory and the existing
+H.E.R.O. dataset. Substitute the archive and classifier paths from your run.
 
 ```bash
 python train_supervised_agent.py train \
@@ -177,7 +195,7 @@ python train_supervised_agent.py train \
 
 This architecture writes version 2 policy checkpoints. Earlier checkpoints with
 explicit progress inputs cannot be resumed or evaluated by this variant; train a
-new policy in a fresh output directory. The step 1 classifier remains compatible.
+new policy in a fresh output directory. The loader also supports version 1 classifier checkpoints.
 
 `--updates` is the total target, including resumed updates. Keep the same model,
 batch, unroll, and optimizer settings. New runs draw optimizer randomness from
@@ -197,8 +215,8 @@ for fitting, and there is no evaluation holdout or internal validation-episode
 split. Checkpoint selection uses independently sampled diagnostic pairs from
 those same training episodes. Metrics label this scope as
 `training_episode_diagnostics_not_heldout`; these are training diagnostics, not
-estimates of generalization. All other classifier defaults stay the same:
-ResNet-18, 5,000 visual updates, 5,000 GRU updates, and temporal window 20.
+estimates of generalization. The integrated classifier extracts frozen DINOv3 features from the existing RGB84
+cycle data and fits the GRU for 5,000 updates with temporal window 20.
 
 The supervised trainer uses all classifier training IDs. The integrated path
 continues with the same return-policy parameters **and AdamW optimizer state
@@ -341,12 +359,12 @@ The plan and report identify the reset protocol as
 image matches the source and whether its reset seed matches the source seed
 (`null` when the source seed is unavailable). Existing evaluations are unchanged;
 rerun into a fresh output directory to use the LCS protocol. With `--save-videos`,
-each attempt also has colored 84×84 `source.mp4`, `rollout.mp4`, and individual
+each attempt also has source-resolution RGB `source.mp4`, `rollout.mp4`, and individual
 target anchor PNGs. Poor imitation fit is a reason to improve training before
 spending compute on these rollouts. Temporal similarity remains a learned proxy
 for accomplishment; the saved videos support visual inspection.
 
-Training requires PyTorch and NumPy. The second module also uses Pillow;
+Classifier training requires PyTorch, NumPy, Transformers and the DINOv3 weights. The second module also uses Pillow;
 environment evaluation uses Gymnasium and ALE, and video output uses OpenCV.
 The existing `r2dreamer` environment provides these packages. Use `--help` on
 either module or either agent subcommand for all arguments. These two modules

@@ -15,8 +15,8 @@ import train_gru_classifier as classifier
 import train_supervised_agent as supervised
 
 
-def write_archive(path, value=0):
-    frames = np.full((3, 84, 84, 3), value, dtype=np.uint8)
+def write_archive(path, value=0, frame_shape=(84, 84, 3)):
+    frames = np.full((3, *frame_shape), value, dtype=np.uint8)
     episodes = [dict(id=7, frames=frames, actions=np.array([0, 1]), complete=True)]
     with path.open('wb') as stream:
         pickle.dump(dict(episodes=episodes, metadata=dict(num_actions=2,
@@ -25,7 +25,7 @@ def write_archive(path, value=0):
 
 
 def write_classifier(path, archive, bias=-10.):
-    model = classifier.RecurrentClassifier('small', 8, 8)
+    model = classifier.legacy_classifier(dict(architecture='small', embedding_dim=8, hidden_dim=8, num_layers=1))
     with torch.no_grad():
         model.head[-1].weight.zero_()
         model.head[-1].bias.fill_(bias)
@@ -43,12 +43,12 @@ def policy_args(archive, checkpoint, output, extra=()):
             '--unroll-length', '2', '--updates', '1', '--score-every', '1', *extra]
 
 
-def test_all_data_trains_one_episode_without_holdout(tmp_path):
+def test_all_data_trains_one_episode_without_holdout(tmp_path, stub_dino):
     archive, output = tmp_path / 'episodes.pkl', tmp_path / 'classifier.pt'
-    write_archive(archive)
+    write_archive(archive, value=255, frame_shape=(210, 160, 3))
     classifier.main(['--archive', str(archive), '--output', str(output), '--all-data',
-                     '--architecture', 'small', '--embedding-dim', '8', '--hidden-dim', '8',
-                     '--visual-steps', '1', '--gru-steps', '1', '--batch-size', '2',
+                     '--hidden-dim', '8',
+                     '--gru-steps', '1', '--batch-size', '2',
                      '--eval-pairs', '2', '--device', 'cpu', '--threads', '1', '--seed', '3'])
     saved = torch.load(output, weights_only=True)
     assert saved['training_episode_ids'] == saved['internal_train_ids'] == [7]
@@ -56,7 +56,18 @@ def test_all_data_trains_one_episode_without_holdout(tmp_path):
     assert saved['diagnostic_episode_ids'] == [7]
     assert saved['selection_scope'] == 'training_episode_diagnostics_not_heldout'
     report = json.loads(output.with_suffix('.metrics.json').read_text())
-    assert len(report['history']) == 2
+    assert [row['stage'] for row in report['history']] == ['gru']
+    assert not output.with_suffix('.visual.pt').exists()
+    assert saved['format_version'] == 2
+    assert 'encoder.' not in ' '.join(saved['model_state'])
+    assert len(stub_dino) == 1
+    pixels, = stub_dino
+    assert pixels.shape == (3, 3, 224, 160)
+    torch.testing.assert_close(pixels[0, 0, 7:217], torch.full((210, 160), (1. - .485) / .229))
+    torch.testing.assert_close(pixels[0, 0, :7], torch.full((7, 160), -.485 / .229))
+    torch.testing.assert_close(pixels[0, 0, -7:], torch.full((7, 160), -.485 / .229))
+    restored, _ = classifier.load_classifier(output)
+    assert restored.gru.input_size == 1024 and not restored.training
 
 
 def test_standalone_split_stays_disjoint_and_requires_enough_episodes():
@@ -122,13 +133,13 @@ def test_finetune_and_resume_cannot_be_combined():
                                '--resume', 'old', '--finetune', 'old'])
 
 
-def test_in_process_classifier_shares_frames_and_never_reloads_files(tmp_path, monkeypatch):
+def test_in_process_classifier_shares_frames_and_never_reloads_files(tmp_path, monkeypatch, stub_dino):
     frames = np.full((3, 84, 84, 3), 10, dtype=np.uint8)
     frames.setflags(write=False)
     episodes = [dict(id=7, frames=frames, actions=np.array([0, 1]), complete=True)]
     args = classifier.parse_args(['--output', str(tmp_path / 'classifier.pt'), '--all-data',
-        '--architecture', 'small', '--embedding-dim', '8', '--hidden-dim', '8',
-        '--visual-steps', '1', '--gru-steps', '1', '--batch-size', '2', '--eval-pairs', '2',
+        '--hidden-dim', '8',
+        '--gru-steps', '1', '--batch-size', '2', '--eval-pairs', '2',
         '--device', 'cpu', '--threads', '1', '--seed', '3'], require_archive=False)
     cache = classifier.cache_features
     observed = []
@@ -153,7 +164,7 @@ def test_in_process_classifier_shares_frames_and_never_reloads_files(tmp_path, m
 
 
 def test_live_policy_reuses_optimizer_and_latest_weights_without_checkpoint_reads(tmp_path, monkeypatch):
-    model = classifier.RecurrentClassifier('small', 8, 8)
+    model = classifier.legacy_classifier(dict(architecture='small', embedding_dim=8, hidden_dim=8, num_layers=1))
     with torch.no_grad():
         model.head[-1].weight.zero_()
         model.head[-1].bias.fill_(-10.)

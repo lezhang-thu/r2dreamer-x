@@ -11,3 +11,4 @@ omegaconf
 cloudpickle
 Pillow
 opencv-python
+transformers>=4.56.2

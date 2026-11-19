@@ -24,11 +24,21 @@ class Environment(FakeEnvironment):
         pass
 
 
-def test_two_real_training_cycles_reuse_live_optimizer_without_data_exchange(tmp_path, monkeypatch):
+def test_two_real_training_cycles_reuse_live_optimizer_without_data_exchange(tmp_path, monkeypatch, stub_dino):
+    # One optimizer step on four toy frames need not yield any anchors. Give
+    # this integration fixture a predictable starting bias for policy training.
+    import train_gru_classifier as classifier
+    initialize = classifier.RecurrentClassifier.__init__
+
+    def init_with_anchors(self, *args, **kwargs):
+        initialize(self, *args, **kwargs)
+        with torch.no_grad():
+            self.head[-1].bias.fill_(-2.)
+
+    monkeypatch.setattr(classifier.RecurrentClassifier, '__init__', init_with_anchors)
     config = OmegaConf.create(dict(
         interval=3, episodes=2, initial_policy=None,
-        classifier=dict(architecture='small', embedding_dim=8, hidden_dim=8,
-                        visual_steps=1, gru_steps=1, batch_size=2, eval_pairs=2,
+        classifier=dict(hidden_dim=8, gru_steps=1, batch_size=2, eval_pairs=2,
                         eval_every=1, seed=3, threads=1),
         policy=dict(updates=1, batch_size=1, unroll_length=2, score_every=1,
                     hidden_dim=8, attention_heads=2, seed=13, threads=1)))

@@ -70,6 +70,8 @@ class ConsoleLogHandle:
             sys.stdout = self._stdout
         if sys.stderr is self._stderr_tee:
             sys.stderr = self._stderr
+        self._stdout_tee.close()
+        self._stderr_tee.close()
         self._file.close()
         self._closed = True
 

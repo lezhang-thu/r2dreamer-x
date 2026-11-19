@@ -39,7 +39,8 @@ def main(config):
     replay_buffer = Buffer(config.buffer)
 
     print("Create envs.")
-    train_envs, eval_envs, obs_space, act_space = make_envs(config.env)
+    archive_path = (logdir / "episodes.pkl").resolve() if config.save_episodes else None
+    train_envs, eval_envs, obs_space, act_space = make_envs(config.env, archive_path)
 
     print("Simulate agent.")
     agent = Dreamer(
@@ -57,6 +58,9 @@ def main(config):
             config.return_exploration, config.env, logdir, act_space.shape[0], config.device,
             action_meanings=action_meanings)
     policy_trainer.begin(agent)
+    if archive_path is not None:
+        summary = train_envs.envs[0].finish_archive()()
+        print(f"Saved trajectories to {archive_path}: {summary}", flush=True)
 
     items_to_save = {
         "agent_state_dict": agent.state_dict(),

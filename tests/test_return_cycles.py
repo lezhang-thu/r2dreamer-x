@@ -85,7 +85,6 @@ class ReturnCycleTests(unittest.TestCase):
                           archive_sha256=source_sha256,
                           training_episode_ids=[episode['id'] for episode in episodes])
         torch.save(checkpoint, args.output)
-        torch.save(checkpoint, args.output.with_name('classifier.visual.pt'))
         return classifier, checkpoint
 
     def demonstrations(self, episodes, ids, classifier, threshold, device, skip_empty):

@@ -30,7 +30,6 @@ VARIANT = Path(__file__).resolve().parent / 'variants-supervised-agent'
 
 
 def variant_modules():
-    # The standalone directory intentionally remains usable as two CLI modules.
     if str(VARIANT) not in sys.path:
         sys.path.insert(0, str(VARIANT))
     import train_gru_classifier
@@ -292,8 +291,6 @@ class ReturnExploration:
         # raw S now; goal images and prefix indices are enough for returning.
         self.archive.consume(source_ids)
         initial_counter_total = int(bank.counts.sum())
-        # Visual-stage weights are no longer used after the recurrent fit.
-        (directory / 'classifier.visual.pt').unlink(missing_ok=True)
         policy_output = directory / 'agent'
         from envs import make_env
         config = OmegaConf.create(OmegaConf.to_container(self.env_config, resolve=True))
