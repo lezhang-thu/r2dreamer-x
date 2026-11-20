@@ -104,8 +104,11 @@ quadratic time cost in the frame count.
 A visit is one contiguous stretch of frames inside the query's radius within
 one episode. A return after leaving, or an episode reset inside the radius,
 starts another visit. Candidates are ordered by fewest visits, then fewest
-frames inside the radius, then archive order. Each pick suppresses candidates
-within its radius. All counts use the original trajectories throughout.
+frames inside the radius. Among candidates tied on both counts, selection
+prefers episodes with fewer representatives already chosen, then the largest
+distance to the 20th-nearest other frame (set the rank with `--neighbors`).
+The seed breaks any remaining ties. Each pick suppresses candidates within its
+radius. All counts use the original trajectories throughout.
 
 `least_visited/` contains up to 100 native PNGs, a ranked `manifest.json`
 with visit counts and source episode/frame coordinates, and `frame_counts.npz`
@@ -113,6 +116,25 @@ with both counts for **every** archived frame. The manifest also reports the
 radius, the number of frames with one visit, and the number whose only neighbor
 inside the radius was themselves. These help distinguish a long single visit
 from a radius so small that many neighborhoods contain just one frame.
+
+To inspect rare neighborhoods with at least five archived frames, reuse the
+original export directory on the training machine. It contains both
+`manifest.json` and `frame_counts.npz`.
+
+```bash
+python variants-supervised-agent/retrieve_least_visited.py \
+  --run-dir logdir/montezuma_100k_0 --device cuda:0 \
+  --reuse-counts logdir/montezuma_100k_0/least_visited \
+  --min-neighborhood-frames 5
+```
+
+This writes `least_visited_reranked/` using the saved radius, counts and
+feature caches. The minimum of five includes the query itself. A single
+visit can still qualify when several consecutive frames fall in its
+neighborhood. The default minimum is one, which also allows isolated frames.
+The manifest reports the number of eligible and selected episodes, the visit
+count distribution across eligible query frames, and the isolation distance
+of each selected state.
 
 For a radius sensitivity check, set `--radius` to a value above or below the
 one in the manifest and pass a fresh `--output` directory. Both feature sets

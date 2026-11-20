@@ -19,6 +19,8 @@ class VisitDensityResult:
     latent_scale: float
     dino_mean: np.ndarray
     dino_scale: float
+    neighbor_distances: np.ndarray
+    isolation_neighbors: int
 
 
 def _normalize(latents, dino, device, batch_size):
@@ -94,57 +96,117 @@ def _exact_match_groups(points):
     return groups
 
 
-def _retrieve(points, offsets, radius, limit, batch_size):
-    n = len(points)
-    if radius == 0:
-        groups = _exact_match_groups(points)
+def _count_visits(points, norms, groups, offsets, radius, batch_size):
+    if groups is not None:
         entries = np.r_[True, groups[1:] != groups[:-1]]
         entries[offsets[:-1]] = True
         visit_counts = np.bincount(groups[entries], minlength=int(groups.max()) + 1)[groups]
         frame_counts = np.bincount(groups)[groups]
-    else:
-        norms = torch.linalg.vector_norm(points, dim=1).square_()
-        starts = torch.as_tensor(offsets[:-1], device=points.device)
-        visits = torch.empty(n, device=points.device, dtype=torch.long)
-        frames = torch.empty_like(visits)
-        for start in range(0, n, batch_size):
-            indices = torch.arange(start, min(start + batch_size, n), device=points.device)
-            inside = _inside_radius(points, norms, indices, radius)
-            frames[indices] = inside.sum(dim=1)
-            entries = torch.empty_like(inside)
-            entries[:, 1:] = inside[:, 1:] & ~inside[:, :-1]
-            entries[:, starts] = inside[:, starts]
-            visits[indices] = entries.sum(dim=1)
-        visit_counts, frame_counts = visits.cpu().numpy(), frames.cpu().numpy()
+        return visit_counts, frame_counts
+    starts = torch.as_tensor(offsets[:-1], device=points.device)
+    visits = torch.empty(len(points), device=points.device, dtype=torch.long)
+    frames = torch.empty_like(visits)
+    for start in range(0, len(points), batch_size):
+        indices = torch.arange(start, min(start + batch_size, len(points)), device=points.device)
+        inside = _inside_radius(points, norms, indices, radius)
+        frames[indices] = inside.sum(dim=1)
+        entries = torch.empty_like(inside)
+        entries[:, 1:] = inside[:, 1:] & ~inside[:, :-1]
+        entries[:, starts] = inside[:, starts]
+        visits[indices] = entries.sum(dim=1)
+    return visits.cpu().numpy(), frames.cpu().numpy()
 
-    # Rank against the full archive before suppressing any candidate. Stable ties
-    # prefer lower frame occupancy, then the earlier original frame index.
-    order = np.lexsort((np.arange(n), frame_counts, visit_counts))
+
+def _isolation_distances(points, norms, candidates, neighbors, batch_size, groups, frame_counts):
+    """Distance to the kth other archived frame. Only the queried count tier needs scoring."""
+    scores = np.zeros(len(candidates), dtype=np.float64)
+    if neighbors == 0:
+        return scores
+    if groups is not None:
+        # At radius zero, rows with k identical peers have isolation distance
+        # zero. For remaining duplicates, query just one copy of each row.
+        _, first, inverse = np.unique(groups[candidates], return_index=True, return_inverse=True)
+        candidates = candidates[first]
+        to_score = np.flatnonzero(frame_counts[candidates] <= neighbors)
+        scores = np.zeros(len(first), dtype=np.float64)
+    else:
+        to_score = np.arange(len(candidates))
+    max_norm = norms.max()
+    for start in range(0, len(to_score), batch_size):
+        positions = to_score[start:start + batch_size]
+        ids = torch.as_tensor(candidates[positions], device=points.device)
+        rows = torch.arange(len(ids), device=points.device)
+        queries = points[ids]
+        squared = torch.addmm(norms[ids, None] + norms, queries, points.T, alpha=-2.0)
+        squared[rows, ids] = torch.inf
+        kth, which = squared.kthvalue(neighbors, dim=1)
+        distances = torch.linalg.vector_norm(queries - points[which], dim=1)
+        # Dot-product rounding can change the kth index for nearly coincident
+        # distances. Where the boundary is ambiguous, use coordinate differences.
+        margin = 16.0 * points.shape[1] * torch.finfo(points.dtype).eps * (norms[ids] + max_norm)
+        ambiguous = ((squared - kth[:, None]).abs() <= margin[:, None]).sum(1) > 1
+        if ambiguous.any():
+            dist = torch.cdist(queries[ambiguous], points, compute_mode="donot_use_mm_for_euclid_dist")
+            dist[torch.arange(len(dist), device=points.device), ids[ambiguous]] = torch.inf
+            distances[ambiguous] = dist.kthvalue(neighbors, dim=1).values
+        scores[positions] = distances.cpu().numpy()
+    return scores[inverse] if groups is not None else scores
+
+
+def _select(points, norms, groups, offsets, radius, visits, frames, limit, neighbors, seed,
+            batch_size, min_neighborhood_frames):
+    n = len(points)
+    eligible = np.flatnonzero(frames >= min_neighborhood_frames)
+    order = eligible[np.lexsort((frames[eligible], visits[eligible]))]
+    boundaries = np.flatnonzero((visits[order[1:]] != visits[order[:-1]])
+                                | (frames[order[1:]] != frames[order[:-1]])) + 1
+    episodes = np.repeat(np.arange(len(offsets) - 1), np.diff(offsets))
+    picks_per_episode = np.zeros(len(offsets) - 1, dtype=np.int64)
+    random_priority = np.random.default_rng(seed).permutation(n)
+    scores = np.empty(n, dtype=np.float64)
     selected = []
     available = np.ones(n, dtype=bool)
-    for i in order:
-        if not available[i]:
+    for tier in np.split(order, boundaries):
+        tier = tier[available[tier]]
+        if not len(tier):
             continue
-        selected.append(i)
+        scores[tier] = _isolation_distances(points, norms, tier, neighbors, batch_size, groups, frames)
+        candidates = tier[np.lexsort((random_priority[tier], -scores[tier]))]
+        while len(candidates):
+            # The first minimum preserves isolation order among equally represented episodes.
+            i = candidates[np.argmin(picks_per_episode[episodes[candidates]])]
+            selected.append(i)
+            if len(selected) == limit:
+                break
+            picks_per_episode[episodes[i]] += 1
+            available[i] = False
+            if frames[i] > 1:
+                if groups is not None:
+                    available[groups == groups[i]] = False
+                else:
+                    query = torch.as_tensor([i], device=points.device)
+                    available[_inside_radius(points, norms, query, radius)[0].cpu().numpy()] = False
+            candidates = candidates[available[candidates]]
         if len(selected) == limit:
             break
-        if radius == 0:
-            available[groups == groups[i]] = False
-        else:
-            query = torch.tensor([i], device=points.device)
-            available[_inside_radius(points, norms, query, radius)[0].cpu().numpy()] = False
-    return np.asarray(selected, dtype=np.int64), visit_counts, frame_counts
+    selected = np.asarray(selected, dtype=np.int64)
+    return selected, scores[selected]
 
 
 @torch.inference_mode()
 def retrieve_least_visited(latents, dino, episode_offsets, *, limit=100, radius=None, neighbors=20,
-                           radius_samples=1024, seed=0, device="cpu", batch_size=256):
+                           radius_samples=1024, seed=0, device="cpu", batch_size=256,
+                           previous_counts=None, min_neighborhood_frames=1):
     """Count entries into each state's closed Euclidean ball, then pick separated states.
 
     Each input row is a frame in chronological episode order. Offsets begin at
     zero and include the exclusive end of the last episode. A neighborhood can
     be entered on the first frame or on a transition from outside to inside.
-    Returned count arrays include every input frame in the original order.
+    The occupancy floor limits candidacy. Every frame still contributes to the
+    counts and nearest-neighbor distances. Within each tied pair of counts,
+    prefer underrepresented episodes, then greater isolation, then seeded ties.
+    A one-frame archive has neighbor rank and reported distance zero. Pass
+    verified (visit_counts, frame_counts) and their original radius to rerank a saved run.
     """
     if latents.ndim != 2 or dino.ndim != 2 or min(latents.shape[1], dino.shape[1]) < 1:
         raise ValueError("Expected two nonempty-width feature matrices")
@@ -156,10 +218,18 @@ def retrieve_least_visited(latents, dino, episode_offsets, *, limit=100, radius=
             or offsets[0] != 0 or offsets[-1] != n or np.any(offsets[1:] <= offsets[:-1])):
         raise ValueError("Episode offsets must strictly increase from zero to the frame count")
     offsets = offsets.astype(np.int64, copy=False)
-    if min(limit, neighbors, radius_samples, batch_size) < 1:
-        raise ValueError("limit, neighbors, radius_samples and batch_size must be positive")
+    if min(limit, neighbors, radius_samples, batch_size, min_neighborhood_frames) < 1:
+        raise ValueError("limit, neighbors, radius_samples, batch_size and min_neighborhood_frames must be positive")
     if radius is not None and (not np.isfinite(radius) or radius < 0):
         raise ValueError("Radius must be finite and nonnegative")
+    isolation_neighbors = min(neighbors, n - 1)
+    if previous_counts is not None:
+        if radius is None:
+            raise ValueError("Reusing counts requires their original radius")
+        visits, frames = map(np.asarray, previous_counts)
+        if (any(a.shape != (n,) or not np.issubdtype(a.dtype, np.integer) for a in (visits, frames))
+                or np.any(visits < 1) or np.any(frames < visits) or np.any(frames > n)):
+            raise ValueError("Expected one valid visit and frame count per archive row")
     points, stats = _normalize(latents, dino, device, batch_size)
     if radius is None:
         neighbors = min(neighbors, n - 1)
@@ -167,5 +237,11 @@ def retrieve_least_visited(latents, dino, episode_offsets, *, limit=100, radius=
         radius = _estimate_radius(points, neighbors, radius_samples, seed, batch_size) if neighbors else 0.0
     else:
         neighbors, radius_samples = None, 0
-    selected, visits, frames = _retrieve(points, offsets, radius, limit, batch_size)
-    return VisitDensityResult(selected, visits, frames, float(radius), neighbors, radius_samples, *stats)
+    norms = torch.linalg.vector_norm(points, dim=1).square_()
+    groups = _exact_match_groups(points) if radius == 0 else None
+    if previous_counts is None:
+        visits, frames = _count_visits(points, norms, groups, offsets, radius, batch_size)
+    selected, distances = _select(points, norms, groups, offsets, radius, visits, frames,
+                                  limit, isolation_neighbors, seed, batch_size, min_neighborhood_frames)
+    return VisitDensityResult(selected, visits, frames, float(radius), neighbors, radius_samples, *stats,
+                              distances, isolation_neighbors)

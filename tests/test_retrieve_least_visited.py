@@ -33,14 +33,18 @@ def test_counts_and_pngs_match_source_with_reordered_feature_records(tmp_path, m
                     episodes=features[::-1]), tmp_path / "embeddings.pt")
     for name in ("latest.pt", "config.yaml"):
         (tmp_path / name).touch()
-    monkeypatch.setattr(export, "load_or_replay_latents", lambda *a, **kw: (torch.zeros(6, 1), {}))
+    dreamer = dict(archive_sha256=provenance["archive_sha256"], checkpoint_sha256="checkpoint",
+                   config_sha256="config", representation="fixture")
+    monkeypatch.setattr(export, "load_or_replay_latents", lambda *a, **kw: (torch.zeros(6, 1), dreamer))
     args = ["--run-dir", str(tmp_path), "--device", "cpu", "--radius", "0.01"]
     export.main(args)
     directory = tmp_path / "least_visited"
     with np.load(directory / "frame_counts.npz") as data:
         np.testing.assert_array_equal(data["visit_counts"], [3, 3, 1, 3, 3, 1])
         np.testing.assert_array_equal(data["neighborhood_frame_counts"], [4, 4, 1, 4, 4, 1])
-        np.testing.assert_array_equal(data["selected_indices"], [2, 5, 0])
+        selected = data["selected_indices"]
+        assert selected[:2].tolist() == [5, 2]
+        assert selected[2] in (0, 1, 3, 4)
     manifest = json.loads((directory / "manifest.json").read_text())
     assert manifest["representative_count"] == 3
     assert manifest["frame_count"] == 6 and manifest["frames_with_one_visit"] == 2
@@ -51,3 +55,11 @@ def test_counts_and_pngs_match_source_with_reordered_feature_records(tmp_path, m
             np.testing.assert_array_equal(image, ep["frames"][row["frame_index"]])
     with pytest.raises(FileExistsError):
         export.main(args)
+    export.main(["--run-dir", str(tmp_path), "--device", "cpu", "--reuse-counts", str(directory),
+                 "--min-neighborhood-frames", "2"])
+    reranked = json.loads((tmp_path / "least_visited_reranked" / "manifest.json").read_text())
+    assert reranked["radius"] == manifest["radius"] and reranked["radius_method"] == "fixed"
+    assert reranked["eligible_query_frames"] == 4 and reranked["eligible_episode_count"] == 2
+    assert reranked["eligible_visit_count_histogram"] == {"3": 4}
+    assert reranked["selected_episode_count"] == reranked["representative_count"] == 1
+    assert reranked["representatives"][0]["neighborhood_frame_count"] == 4
