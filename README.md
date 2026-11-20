@@ -76,6 +76,51 @@ Authenticate on the training machine or point the extractor's `--backbone` at
 a local Hugging Face snapshot. With the [Kaggle timm weights](https://www.kaggle.com/datasets/ozanize/dinov3-vitl16-weights),
 pass `--backbone /path/to/dinov3_vitl16.pth` to the extractor.
 
+### Retrieve least-visited states from an existing run
+
+From the repository root, run
+
+```bash
+python variants-supervised-agent/retrieve_least_visited.py \
+  --run-dir logdir/montezuma_100k_0 --device cuda:0
+```
+
+This uses the existing `embeddings.pt`, `episodes.pkl`, `latest.pt`, and
+`config.yaml`. On the first run it replays the recorded actions through the
+original Atari wrappers, checks the native screens against the archive, and
+encodes the pooled observations with the final checkpoint. Each episode starts
+a new Dreamer history. The deterministic recurrent state and the categorical
+posterior mode form the history vector. For the 100M model the reusable
+`dreamer_latents/` cache takes about 3.1 GB per 100k frames.
+
+Every archived frame, including resets and the final collected prefix, is
+a query. The distance is Euclidean on the concatenated Dreamer and DINOv3
+blocks after centering each block and dividing by its root-mean-square distance
+from its mean. The default radius is the median distance to the 20th nearest
+**other** frame for up to 1,024 uniformly sampled queries. All frames take part
+in neighborhood counting. The computation compares pairs in batches and has
+quadratic time cost in the frame count.
+
+A visit is one contiguous stretch of frames inside the query's radius within
+one episode. A return after leaving, or an episode reset inside the radius,
+starts another visit. Candidates are ordered by fewest visits, then fewest
+frames inside the radius, then archive order. Each pick suppresses candidates
+within its radius. All counts use the original trajectories throughout.
+
+`least_visited/` contains up to 100 native PNGs, a ranked `manifest.json`
+with visit counts and source episode/frame coordinates, and `frame_counts.npz`
+with both counts for **every** archived frame. The manifest also reports the
+radius, the number of frames with one visit, and the number whose only neighbor
+inside the radius was themselves. These help distinguish a long single visit
+from a radius so small that many neighborhoods contain just one frame.
+
+For a radius sensitivity check, set `--radius` to a value above or below the
+one in the manifest and pass a fresh `--output` directory. Both feature sets
+are reused. Use `--limit` to change the number of PNGs or `--batch-size` to
+adjust the number of distance queries processed together.
+
+### Fit the GRU classifier and export its anchors
+
 To fit the GRU on all collected trajectories, pass `--all-data`. Use a fresh
 classifier output path for each experiment and reuse `embeddings.pt`.
 

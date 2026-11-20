@@ -185,7 +185,7 @@ class RSSM(nn.Module):
         logits = torch.stack(logits, dim=1)
         return stochs, deters, logits
 
-    def obs_step(self, stoch, deter, prev_action, embed, reset):
+    def obs_step(self, stoch, deter, prev_action, embed, reset, *, sample=True):
         """Single posterior step."""
         # (B, S, K), (B, D), (B, A), (B, E), (B,)
         stoch = torch.where(rpad(reset,
@@ -207,9 +207,9 @@ class RSSM(nn.Module):
         # (B, S, K)
         logit = self._obs_net(x)
 
-        # Sample discrete stochastic state via straight-through Gumbel-Softmax.
-        # (B, S, K)
-        stoch = self.get_dist(logit).rsample()
+        # Offline archive replay uses the posterior mode for a repeatable latent.
+        posterior = self.get_dist(logit)
+        stoch = posterior.rsample() if sample else posterior.base_dist.mode
         return stoch, deter, logit
 
     def img_step(self, stoch, deter, prev_action):
